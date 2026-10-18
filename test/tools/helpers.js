@@ -74,6 +74,22 @@ export class MockAnyListClient {
   getLists() { return this._lists; }
   getStores() { return this._stores || []; }
 
+  // Barcode lookup: `_products` maps a UPC to what AnyList would return.
+  // `_lookupError` makes the lookup fail, as a network or server error would.
+  async lookupUpc(upc) {
+    this._lookups = (this._lookups || 0) + 1;
+    if (this._lookupError) throw this._lookupError;
+    return (this._products || {})[upc] || null;
+  }
+
+  findItemByUpc(upc) {
+    return this._items.find(i => i.productUpc === upc) || null;
+  }
+
+  async addProduct(product, qty, notes) {
+    this._items.push({ name: product.name, quantity: qty, notes, productUpc: product.productUpc, photoIds: product.photoIds });
+  }
+
   async addItem(name, qty, notes, category, store = null) {
     this._items.push({ name, quantity: qty, notes, category, store });
   }

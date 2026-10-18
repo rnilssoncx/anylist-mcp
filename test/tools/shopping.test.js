@@ -119,6 +119,79 @@ describe('shopping tool', () => {
     });
   });
 
+  describe('barcodes', () => {
+    const KIOLBASSA = 'Kiolbassa Organic Grass-fed Beef Hickory Smoked Sausage, 4 ct';
+
+    beforeEach(() => {
+      client._items = [{ name: KIOLBASSA, checked: true, productUpc: '0026875130116', photoIds: ['p1'] }];
+      client._products = {
+        '0026875130116': { name: 'Kiolbassa Beef Smoked Sausage', productUpc: '0026875130116', photoIds: ['p1'] },
+        '0074338007611': { name: 'Sabrett Cocktail Beef Franks', productUpc: '0074338007611', categoryMatchId: 'frozen-foods', photoIds: ['p2'] },
+      };
+    });
+
+    it('lookup_upc names the product and says when it is already saved', async () => {
+      const result = await handlers.shopping({ action: 'lookup_upc', upc: '0026875130116' });
+      const text = result.content[0].text;
+      assert.ok(text.includes('"Kiolbassa Beef Smoked Sausage"'));
+      assert.ok(text.includes(`Already saved on "Test List" as "${KIOLBASSA}" (checked off)`));
+    });
+
+    it('lookup_upc reports a miss as a database miss, not as no product', async () => {
+      const result = await handlers.shopping({ action: 'lookup_upc', upc: '0000000000000' });
+      const text = result.content[0].text;
+      assert.ok(text.includes('AnyList has no product for barcode 0000000000000'));
+      assert.ok(text.includes("does not mean the product doesn't exist"));
+      assert.notEqual(result.isError, true);
+    });
+
+    it('a failed lookup is an error, never a "no product"', async () => {
+      // The absence rule: "could not look" and "looked and found nothing" are
+      // different answers, and only the second may say there was no match.
+      client._lookupError = new Error('Product lookup returned HTTP 503');
+      const result = await handlers.shopping({ action: 'lookup_upc', upc: '0074338007611' });
+      const text = result.content[0].text;
+      assert.equal(result.isError, true);
+      assert.ok(text.includes('HTTP 503'));
+      assert.ok(!text.includes('no product'));
+    });
+
+    it('add_by_upc re-adds the item already saved with that barcode, without a lookup', async () => {
+      const result = await handlers.shopping({ action: 'add_by_upc', upc: '0026875130116' });
+      assert.equal(client._items.at(-1).name, KIOLBASSA);
+      assert.equal(client._lookups || 0, 0);
+      assert.ok(result.content[0].text.includes('already saved with barcode 0026875130116'));
+    });
+
+    it('add_by_upc adds a new product with its barcode and photo', async () => {
+      const result = await handlers.shopping({ action: 'add_by_upc', upc: '0074338007611' });
+      const added = client._items.at(-1);
+      assert.equal(added.name, 'Sabrett Cocktail Beef Franks');
+      assert.equal(added.productUpc, '0074338007611');
+      assert.deepEqual(added.photoIds, ['p2']);
+      assert.ok(result.content[0].text.includes('from barcode 0074338007611'));
+    });
+
+    it('add_by_upc adds nothing when the barcode has no product', async () => {
+      const before = client._items.length;
+      const result = await handlers.shopping({ action: 'add_by_upc', upc: '0000000000000' });
+      assert.equal(client._items.length, before);
+      assert.ok(result.content[0].text.includes('Nothing was added'));
+    });
+
+    it('accepts a barcode with spaces or dashes', async () => {
+      const result = await handlers.shopping({ action: 'lookup_upc', upc: '0 074338-007611' });
+      assert.ok(result.content[0].text.includes('Sabrett'));
+    });
+
+    it('refuses something that is not a barcode, without looking it up', async () => {
+      const result = await handlers.shopping({ action: 'add_by_upc', upc: 'sausage' });
+      assert.equal(result.isError, true);
+      assert.ok(result.content[0].text.includes('is not a barcode'));
+      assert.equal(client._lookups || 0, 0);
+    });
+  });
+
   describe('add_items', () => {
     it('adds multiple items from plain names', async () => {
       const result = await handlers.shopping({ action: 'add_items', items: ['Milk', 'Eggs', 'Bread'] });

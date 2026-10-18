@@ -21,7 +21,9 @@ function buildDescription(stores) {
 - delete_item: Permanently remove an item from a list
 - get_favorites: Get favorite items for a list
 - get_recents: Get recently added items for a list
-- list_stores: list stores available for the list (if any)`;
+- list_stores: list stores available for the list (if any)
+- lookup_upc: Say what product a barcode is, and whether it is already saved on the list
+- add_by_upc: Add a product by barcode. An item already saved with that barcode is re-added; otherwise the looked-up product is added with its barcode and photo`;
   if (!stores || stores.length === 0) return base;
   const storeList = stores.map(s => s.name).join(', ');
   return `${base}\n\nAvailable stores: ${storeList}`;
@@ -94,6 +96,19 @@ export function register(server, getClient) {
     return { choices: matches };
   }
 
+  // Barcodes are digits; scanners and people add spaces and dashes.
+  function normaliseUpc(upc) {
+    const digits = String(upc || "").replace(/[\s-]/g, "");
+    if (!/^\d{8,14}$/.test(digits)) {
+      throw new Error(`"${upc}" is not a barcode — expected 8 to 14 digits`);
+    }
+    return digits;
+  }
+
+  function noProductText(upc) {
+    return `AnyList has no product for barcode ${upc}. Its database has no match — that does not mean the product doesn't exist.`;
+  }
+
   function choicesText(itemName, choices) {
     return `Several saved items match "${itemName}":\n${choices.map(c => `  - ${c}`).join("\n")}`;
   }
@@ -105,7 +120,9 @@ export function register(server, getClient) {
     description: buildDescription([]),
     inputSchema: {
       action: z.enum(["list_lists", "list_items", "add_item", "add_items",
-        "set_item_store", "check_item", "uncheck_item", "delete_item", "get_favorites", "get_recents", "list_stores"]).describe("The shopping action to perform"),
+        "set_item_store", "check_item", "uncheck_item", "delete_item", "get_favorites", "get_recents", "list_stores",
+        "lookup_upc", "add_by_upc"]).describe("The shopping action to perform"),
+      upc: z.string().optional().describe("Barcode digits (lookup_upc and add_by_upc only)"),
       list_name: z.string().optional().describe("Name of the list (defaults to configured default list)"),
       name: z.string().optional().describe("Item name (required for add_item, set_item_store, check_item, uncheck_item, delete_item)"),
       items: z.array(z.union([
@@ -243,6 +260,40 @@ export function register(server, getClient) {
             unresolved.forEach(u => summary.push(u));
           }
           return failed.length > 0 ? errorResponse(summary.join("\n")) : textResponse(summary.join("\n"));
+        }
+        case "lookup_upc": {
+          const upc = normaliseUpc(params.upc);
+          await client.connect(list_name || null);
+          const product = await client.lookupUpc(upc);
+          if (!product) return textResponse(noProductText(upc));
+          const category = product.categoryMatchId ? ` (${product.categoryMatchId})` : "";
+          const saved = client.findItemByUpc(upc);
+          const onList = saved
+            ? `\nAlready saved on "${client.targetList.name}" as "${saved.name}"${saved.checked ? " (checked off)" : ""}.`
+            : "";
+          return textResponse(`Barcode ${upc} is "${product.name}"${category}.${onList}`);
+        }
+        case "add_by_upc": {
+          const upc = normaliseUpc(params.upc);
+          await client.connect(list_name || null);
+          const { valid, message } = await validateStoreName(client, params.store_name);
+          if (!valid) return errorResponse(message);
+
+          // An item already carrying this barcode is the product, with its
+          // store and photo; re-adding it by name keeps all of that.
+          const saved = client.findItemByUpc(upc);
+          if (saved) {
+            await client.addItem(saved.name, quantity || 1, notes || null, "other", params.store_name || null);
+            return textResponse(`Successfully added "${saved.name}" to list "${client.targetList.name}" (already saved with barcode ${upc})`);
+          }
+
+          const product = await client.lookupUpc(upc);
+          if (!product) {
+            return textResponse(`${noProductText(upc)}\nNothing was added. Ask what it is, or add it by name.`);
+          }
+          await client.addProduct(product, quantity || 1, notes || null);
+          if (params.store_name) await client.setItemStore(product.name, params.store_name);
+          return textResponse(`Successfully added "${product.name}" to list "${client.targetList.name}" from barcode ${upc}`);
         }
         case "check_item": {
           let itemName = name;

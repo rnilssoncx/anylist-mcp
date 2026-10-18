@@ -74,6 +74,36 @@ class AnyListClient {
     }
   }
 
+  /**
+   * Look up a product by barcode. Returns null when AnyList has no match; a
+   * lookup that fails for any other reason throws.
+   */
+  async lookupUpc(upc) {
+    if (!this.client) throw new Error('Not connected to AnyList. Call connect() first.');
+    return this.client.lookupProduct(upc);
+  }
+
+  /** The item on the target list already carrying this barcode, if any. */
+  findItemByUpc(upc) {
+    return (this.targetList?.items || []).find(i => i.productUpc === upc) || null;
+  }
+
+  /**
+   * Add a looked-up product as a new item, keeping its barcode and photo so
+   * the apps show it as that product rather than as a typed name.
+   */
+  async addProduct(product, quantity = 1, notes = null) {
+    if (!this.targetList) throw new Error('Not connected to any list. Call connect() first.');
+    const options = { name: product.name, productUpc: product.productUpc, photoIds: product.photoIds || [] };
+    if (product.categoryMatchId) options.categoryMatchId = product.categoryMatchId;
+    if (notes !== null) options.details = notes;
+    const rawQuantity = quantity == null ? "" : String(quantity).trim();
+    if (rawQuantity !== "" && rawQuantity !== "1") options.quantity = rawQuantity;
+    const item = this.client.createItem(options);
+    await this.targetList.addItem(item);
+    console.error(`Added product: ${item.name}`);
+  }
+
   getAvailableListNames() {
     if (!this.client || !this.client.lists) return [];
     return this.client.lists.map(list => list.name);
