@@ -26,6 +26,26 @@ function renderLogin(res, error = "") {
 
 const router = Router();
 
+// Stored as a JSON array; older rows hold a single plain URI.
+function registeredRedirectUris(client) {
+  if (!client.redirect_uri) return [];
+  try {
+    const parsed = JSON.parse(client.redirect_uri);
+    return Array.isArray(parsed) ? parsed : [client.redirect_uri];
+  } catch {
+    return [client.redirect_uri];
+  }
+}
+
+function isUrl(value) {
+  try {
+    new URL(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // BASE_URL is optional: if not set, derive from the incoming request so the
 // server works behind any proxy (including a Cloudflare quick tunnel) without
 // needing to know its public URL at startup.
@@ -70,12 +90,13 @@ router.get(["/.well-known/oauth-protected-resource", "/.well-known/oauth-protect
 router.post(["/oauth/register", "/register"], (req, res) => {
   const { redirect_uris, client_name } = req.body || {};
   const clientId = randomUUID();
-  const redirectUri = Array.isArray(redirect_uris) ? redirect_uris[0] : redirect_uris || null;
-  registerOAuthClient({ clientId, redirectUri });
+  // Keep every registered URI: a client may send several and use any of them.
+  const uris = (Array.isArray(redirect_uris) ? redirect_uris : [redirect_uris]).filter(Boolean);
+  registerOAuthClient({ clientId, redirectUri: uris.length ? JSON.stringify(uris) : null });
   res.status(201).json({
     client_id: clientId,
     client_secret: null,
-    redirect_uris: redirectUri ? [redirectUri] : [],
+    redirect_uris: uris,
     client_name: client_name || "MCP Client",
     token_endpoint_auth_method: "none",
     grant_types: ["authorization_code", "refresh_token"],
@@ -93,11 +114,25 @@ router.get(["/oauth/authorize", "/authorize"], (req, res) => {
     return res.status(400).send("Missing required parameter: client_id");
   }
 
-  // Confidential clients (those with a client_secret) don't use PKCE
   const clientRecord = getOAuthClientWithSecret(client_id);
-  const isConfidential = !!(clientRecord && clientRecord.client_secret_hash);
+  if (!clientRecord) {
+    return res.status(400).send("Unknown client_id");
+  }
+
+  // Confidential clients (those with a client_secret) don't use PKCE
+  const isConfidential = !!clientRecord.client_secret_hash;
   if (!isConfidential && !code_challenge) {
     return res.status(400).send("Missing required parameter: code_challenge");
+  }
+
+  // The code goes to redirect_uri, so it must be one the client registered.
+  // Registration is open, so a public client with none registered could
+  // otherwise name any destination. A confidential client's code is useless
+  // without its secret, so one registered without URIs keeps working.
+  const registered = registeredRedirectUris(clientRecord);
+  const allowed = registered.length ? registered.includes(redirect_uri) : isConfidential;
+  if (!allowed || !isUrl(redirect_uri)) {
+    return res.status(400).send("redirect_uri is not registered for this client");
   }
 
   // Store OAuth params in session
@@ -146,6 +181,10 @@ async function handleAuthCodeGrant(req, res) {
   }
 
   if (code_verifier) {
+    // Public client: the code is only good for the client it was issued to.
+    if (client_id !== codeRow.client_id) {
+      return res.status(400).json({ error: "invalid_grant", error_description: "Code was issued to another client" });
+    }
     // Public client: verify PKCE
     const expected = codeRow.code_challenge;
     const method = codeRow.challenge_method;
@@ -322,7 +361,9 @@ function completeAuth(req, res, user) {
     return res.redirect("/setup");
   }
 
-  return issueCodeAndRedirect(req, res, user.id, oauth);
+  // Always ask. A login reached through someone else's authorize link would
+  // otherwise send the code straight to wherever that link pointed.
+  return res.redirect("/oauth/consent");
 }
 
 /**
@@ -336,6 +377,8 @@ router.get("/oauth/consent", (req, res) => {
   res.render("consent", {
     clientId: req.session.oauthParams.client_id,
     scope: req.session.oauthParams.scope || "mcp",
+    // Validated as a URL at /oauth/authorize, and a host cannot carry markup.
+    redirectHost: new URL(req.session.oauthParams.redirect_uri).host,
   });
 });
 

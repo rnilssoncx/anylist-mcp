@@ -33,6 +33,11 @@
       Access your AnyList shopping lists, recipes, and meal planner.
     </div>
 
+    <div class="scope-box">
+      <strong>Access will be sent to:</strong>
+      {{redirectHost}} — only allow this if you started the connection there.
+    </div>
+
     <form method="POST" action="/oauth/consent">
       <div class="actions">
         <button type="submit" name="approve" value="yes" class="btn btn-primary">Allow</button>
