@@ -54,6 +54,71 @@ describe('shopping tool', () => {
     });
   });
 
+  describe('add_item matching saved items', () => {
+    // Saved items are specific products — scanned, with a store and a photo.
+    // Re-adding one by its exact name keeps those; adding a generic name does not.
+    beforeEach(() => {
+      client._items = [
+        { name: 'Beemster Swiss Cheese', checked: true, store: 'Kroger' },
+        { name: 'sausage', checked: true },
+        { name: 'Kiolbassa Organic Grass-fed Beef Hickory Smoked Sausage, 4 ct', checked: true },
+        { name: 'H-E-B Premium Beef Smoked Sausage Links - Texas-Size Pack', checked: true },
+      ];
+    });
+
+    it('reuses the one saved item a partial name matches', async () => {
+      const result = await handlers.shopping({ action: 'add_item', name: 'beemster' });
+      assert.equal(client._items.at(-1).name, 'Beemster Swiss Cheese');
+      assert.ok(result.content[0].text.includes('Successfully added "Beemster Swiss Cheese"'));
+    });
+
+    it('adds nothing and lists the candidates when several saved items match', async () => {
+      // Even though "sausage" is itself an exact item: the specific products are
+      // what the person most likely means, so the generic one does not win silently.
+      const before = client._items.length;
+      const result = await handlers.shopping({ action: 'add_item', name: 'sausage' });
+      const text = result.content[0].text;
+      assert.equal(client._items.length, before);
+      assert.ok(text.includes('Nothing was added'));
+      assert.ok(text.includes('Kiolbassa Organic Grass-fed Beef Hickory Smoked Sausage, 4 ct'));
+      assert.ok(text.includes('H-E-B Premium Beef Smoked Sausage Links - Texas-Size Pack'));
+      assert.ok(text.includes('exact: true'));
+      assert.notEqual(result.isError, true);
+    });
+
+    it('matches a plural against a singular saved item', async () => {
+      const before = client._items.length;
+      const result = await handlers.shopping({ action: 'add_item', name: 'sausages' });
+      assert.equal(client._items.length, before);
+      assert.ok(result.content[0].text.includes('Nothing was added'));
+    });
+
+    it('exact: true adds the name as written, without matching', async () => {
+      await handlers.shopping({ action: 'add_item', name: 'sausage', exact: true });
+      assert.equal(client._items.at(-1).name, 'sausage');
+    });
+
+    it('adds a name nothing matches as a new item', async () => {
+      await handlers.shopping({ action: 'add_item', name: 'oat milk' });
+      assert.equal(client._items.at(-1).name, 'oat milk');
+    });
+
+    it('add_items resolves each entry and holds back the ambiguous ones', async () => {
+      const before = client._items.length;
+      const result = await handlers.shopping({ action: 'add_items', items: ['beemster', 'sausage', 'oat milk'] });
+      const text = result.content[0].text;
+      assert.deepEqual(client._items.slice(before).map(i => i.name), ['Beemster Swiss Cheese', 'oat milk']);
+      assert.ok(text.includes('Kiolbassa'));
+      assert.ok(text.includes('exact: true'));
+    });
+
+    it('add_items honours exact on an entry', async () => {
+      const before = client._items.length;
+      await handlers.shopping({ action: 'add_items', items: [{ name: 'sausage', exact: true }] });
+      assert.deepEqual(client._items.slice(before).map(i => i.name), ['sausage']);
+    });
+  });
+
   describe('add_items', () => {
     it('adds multiple items from plain names', async () => {
       const result = await handlers.shopping({ action: 'add_items', items: ['Milk', 'Eggs', 'Bread'] });

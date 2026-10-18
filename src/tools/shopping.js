@@ -14,8 +14,8 @@ function buildDescription(stores) {
   const base = `Manage AnyList shopping lists and items. Actions:
 - list_lists: Show all lists with item counts
 - list_items: Show items on a list (grouped by category)
-- add_item: Add an item to a list
-- add_items: Add several items to a list in one call (use this instead of repeating add_item)
+- add_item: Add an item to a list. A name is matched against items already saved on the list (specific products, often scanned): one match is re-added, several are listed back without adding anything — ask which one, or resend with exact: true
+- add_items: Add several items to a list in one call (use this instead of repeating add_item); entries are matched the same way
 - check_item: Check off (complete) an item
 - uncheck_item: Uncheck a previously checked-off item (make it active again)
 - delete_item: Permanently remove an item from a list
@@ -69,6 +69,35 @@ export function register(server, getClient) {
     return await elicitItemChoice(itemName, matches);
   }
 
+  // Items already on the list, checked or not, are specific products — a
+  // scanned "Beemster Swiss Cheese" with its store, not "cheese". Re-adding one
+  // by its exact name keeps all of that, so a requested name is matched against
+  // them first. A trailing plural is dropped so "sausages" finds "sausage".
+  function findSavedMatches(client, itemName) {
+    const lower = itemName.toLowerCase().trim();
+    const stem = lower.length > 3 ? lower.replace(/(es|s)$/, "") : lower;
+    const names = (client.targetList.items || [])
+      .map(i => i.name)
+      .filter(n => n.toLowerCase().includes(lower) || n.toLowerCase().includes(stem));
+    return [...new Set(names)];
+  }
+
+  // One match is used; several are a question for the person, so nothing is
+  // added. An exact name that also matches more specific items does not win
+  // silently — the specific product is usually what was meant. `exact` skips
+  // matching, for "just add it as I said".
+  function resolveAddName(client, itemName, exact) {
+    if (exact) return { name: itemName };
+    const matches = findSavedMatches(client, itemName);
+    if (matches.length === 0) return { name: itemName };
+    if (matches.length === 1) return { name: matches[0] };
+    return { choices: matches };
+  }
+
+  function choicesText(itemName, choices) {
+    return `Several saved items match "${itemName}":\n${choices.map(c => `  - ${c}`).join("\n")}`;
+  }
+
   let lastStoreSignature = '';
 
   const registeredTool = server.registerTool("shopping", {
@@ -87,8 +116,10 @@ export function register(server, getClient) {
           notes: z.string().optional(),
           category: z.enum(valid_categories).optional(),
           store_name: z.string().optional(),
+          exact: z.boolean().optional(),
         })
-      ])).optional().describe("Items to add (add_items only). Each entry is either a plain item name or an object with name/quantity/notes/category/store_name"),
+      ])).optional().describe("Items to add (add_items only). Each entry is either a plain item name or an object with name/quantity/notes/category/store_name/exact"),
+      exact: z.boolean().optional().describe("Add the name exactly as given, without matching saved items (add_item only). Use after the person has chosen, or said to add it as written"),
       quantity: z.union([z.number().min(1), z.string().min(1)]).optional().describe("Item quantity, e.g. 2 or \"500 g\" (add_item only, defaults to 1)"),
       notes: z.string().optional().describe("Notes for the item (add_item only)"),
       include_checked: z.boolean().optional().describe("Include checked-off items (list_items only, default false)"),
@@ -167,8 +198,16 @@ export function register(server, getClient) {
           if (!valid)
             return errorResponse(message); 
 
-          await client.addItem(itemName, quantity || 1, notes || null, params.category || "other", params.store_name || null);
-          return textResponse(`Successfully added "${itemName}" to list "${client.targetList.name}"`);
+          const resolved = resolveAddName(client, itemName, params.exact);
+          if (resolved.choices) {
+            return textResponse(
+              `${choicesText(itemName, resolved.choices)}\nNothing was added. Ask which one they mean. ` +
+              `To add exactly "${itemName}", call add_item again with exact: true.`
+            );
+          }
+
+          await client.addItem(resolved.name, quantity || 1, notes || null, params.category || "other", params.store_name || null);
+          return textResponse(`Successfully added "${resolved.name}" to list "${client.targetList.name}"`);
         }
         case "add_items": {
           const entries = params.items;
@@ -176,6 +215,7 @@ export function register(server, getClient) {
           await client.connect(list_name);
           const added = [];
           const failed = [];
+          const unresolved = [];
           for (const entry of entries) {
             const item = typeof entry === "string" ? { name: entry } : entry;
             try {
@@ -184,8 +224,13 @@ export function register(server, getClient) {
               }
               const { valid, message } = await validateStoreName(client, item.store_name);
               if (!valid) throw new Error(message);
-              await client.addItem(item.name, item.quantity || 1, item.notes || null, item.category || "other", item.store_name || null);
-              added.push(item.name);
+              const resolved = resolveAddName(client, item.name, item.exact);
+              if (resolved.choices) {
+                unresolved.push(choicesText(item.name, resolved.choices));
+                continue;
+              }
+              await client.addItem(resolved.name, item.quantity || 1, item.notes || null, item.category || "other", item.store_name || null);
+              added.push(resolved.name);
             } catch (error) {
               failed.push(`${item.name}: ${error.message}`);
             }
@@ -193,6 +238,10 @@ export function register(server, getClient) {
           const summary = [`Added ${added.length} of ${entries.length} items to list "${client.targetList.name}":`];
           added.forEach(n => summary.push(`  ✓ ${n}`));
           failed.forEach(f => summary.push(`  ✗ ${f}`));
+          if (unresolved.length > 0) {
+            summary.push("", "Not added — ask which one they mean, or resend the entry with exact: true:");
+            unresolved.forEach(u => summary.push(u));
+          }
           return failed.length > 0 ? errorResponse(summary.join("\n")) : textResponse(summary.join("\n"));
         }
         case "check_item": {
