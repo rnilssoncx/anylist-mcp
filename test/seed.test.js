@@ -95,5 +95,8 @@ describe('seed', () => {
     await seed(base());
     await assert.rejects(seed({ ...base(), SEED_EMAIL: 'other@example.com' }),
       /seed: SEED_CLIENT_ID is already registered to a different user/);
+    // Refused before writing: no second user, and the first user's login untouched.
+    assert.equal(users().length, 1);
+    assert.equal(db.getUserByEmail('other@example.com'), undefined);
   });
 });

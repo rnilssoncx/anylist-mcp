@@ -23,7 +23,8 @@ const TOOLS = {
  * skipped: a typo would otherwise quietly serve fewer tools than intended.
  */
 export function enabledTools(setting = process.env.ANYLIST_TOOLS) {
-  const names = (setting || "").split(",").map(s => s.trim()).filter(Boolean);
+  // Deduplicated: registering a tool twice throws in the MCP SDK.
+  const names = [...new Set((setting || "").split(",").map(s => s.trim()).filter(Boolean))];
   if (names.length === 0) return Object.keys(TOOLS);
   const unknown = names.filter(n => !(n in TOOLS));
   if (unknown.length > 0) {

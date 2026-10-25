@@ -34,17 +34,19 @@ export async function seed(env = process.env) {
     throw new Error(`seed: SEED_CLIENT_SECRET must be at least ${MIN_SECRET_LENGTH} characters`);
   }
 
-  const user = getUserByEmail(env.SEED_EMAIL) || createUser({ id: randomUUID(), email: env.SEED_EMAIL });
+  // Every check comes before the first write, so a refusal leaves nothing behind.
+  const existing = getUserByEmail(env.SEED_EMAIL);
+  const client = getOAuthClientWithSecret(env.SEED_CLIENT_ID);
+  if (client && client.user_id !== existing?.id) {
+    throw new Error("seed: SEED_CLIENT_ID is already registered to a different user");
+  }
+
+  const user = existing || createUser({ id: randomUUID(), email: env.SEED_EMAIL });
   upsertAnyListCredentials(user.id, {
     username: env.ANYLIST_USERNAME,
     password: env.ANYLIST_PASSWORD,
     defaultListName: env.ANYLIST_LIST_NAME || null,
   });
-
-  const client = getOAuthClientWithSecret(env.SEED_CLIENT_ID);
-  if (client && client.user_id !== user.id) {
-    throw new Error("seed: SEED_CLIENT_ID is already registered to a different user");
-  }
   const secretHash = () => bcrypt.hash(env.SEED_CLIENT_SECRET, 12);
   if (!client) {
     createConfidentialClient({ clientId: env.SEED_CLIENT_ID, clientSecretHash: await secretHash(), userId: user.id, clientName: "seeded" });

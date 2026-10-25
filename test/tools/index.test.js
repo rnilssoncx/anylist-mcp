@@ -29,6 +29,14 @@ describe('ANYLIST_TOOLS', () => {
     assert.deepEqual(registered('shopping,health_check'), ['health_check', 'shopping']);
   });
 
+  it('registers a single named tool without adding health_check', () => {
+    assert.deepEqual(registered('shopping'), ['shopping']);
+  });
+
+  it('registers a repeated name once', () => {
+    assert.deepEqual(enabledTools('shopping,shopping'), ['shopping']);
+  });
+
   it('tolerates spaces around names', () => {
     assert.deepEqual(registered(' shopping , health_check '), ['health_check', 'shopping']);
   });

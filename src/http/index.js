@@ -16,7 +16,7 @@ import { getDb, loadAllowedEmails, deleteExpiredTokens } from "./db.js";
 import { getOrCreateSession } from "./session-manager.js";
 import oauthRouter, { requireBearerToken } from "./auth/oauth.js";
 import onboardingRouter from "./onboarding.js";
-import { registerAllTools } from "../tools/index.js";
+import { registerAllTools, enabledTools } from "../tools/index.js";
 import { isGoogleEnabled } from "./auth/providers/google.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -39,6 +39,14 @@ function validateEnv() {
     console.warn("BASE_URL not set — will derive from incoming request Host header (fine for dev/tunnel use)");
   }
   loadAllowedEmails(); // Will throw + exit if file missing
+  // Tools are registered per session, so a bad ANYLIST_TOOLS would otherwise
+  // pass startup and fail every session instead. Refuse it here.
+  try {
+    enabledTools();
+  } catch (error) {
+    console.error(error.message);
+    process.exit(1);
+  }
 }
 
 // ── Express app setup ─────────────────────────────────────────────────────────
@@ -71,7 +79,9 @@ app.use(session({
 app.use((req, res, next) => {
   const start = Date.now();
   res.on("finish", () => {
-    const body = req.method === "POST" && (req.path === "/sse" || req.path === "/mcp") && req.body
+    // Request bodies carry the household's lists; they are logged only when
+    // asked for, never by default.
+    const body = process.env.LOG_REQUEST_BODIES === "1" && req.method === "POST" && (req.path === "/sse" || req.path === "/mcp") && req.body
       ? " body:" + JSON.stringify(req.body).slice(0, 200)
       : "";
     console.log(`${req.method} ${req.path} → ${res.statusCode} (${Date.now() - start}ms) session:${req.session?.id?.slice(0, 8) ?? "none"} user:${req.session?.userId ?? "-"}${body}`);
