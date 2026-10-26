@@ -134,8 +134,11 @@ class AnyListClient {
   // callers: delete the item and re-add it with the new quantity.
   //
   // Returns what happened — "added", "rechecked" (it was checked off) or
-  // "already" (it was on the list) — so the tool can say which, and say when a
-  // quantity it was given did not reach the apps.
+  // "already" (it was on the list) — so the tool can say which.
+  //
+  // A store given here is added to the item's stores, never put in place of
+  // them: a saved item is often bought at two or three, and re-adding it "from
+  // Kroger" is not a request to forget the others.
   async addItem(itemName, quantity = 1, notes = null, category = "other", store = null) {
     if (!this.targetList) {
       const error = new Error('Not connected to any list. Call connect() first.');
@@ -151,10 +154,12 @@ class AnyListClient {
       if (existingItem) {
         // Item exists - check if it's checked (completed)
 
+        // Nothing changes the quantity unless one was given: "1" is the
+        // default every caller passes, not a request to reset "2 lb".
+        const newQuantity = quantity != null && String(quantity).trim() !== "1" ? quantity : null;
         if (existingItem.checked) {
           // Uncheck the item to make it active again
           existingItem.checked = false;
-          existingItem.quantity = quantity; // Update quantity if needed
           if (notes !== null) {
             existingItem.details = notes;
           }
@@ -164,18 +169,17 @@ class AnyListClient {
           outcome = "rechecked";
         } else {
           console.error(`Item "${itemName}" already exists and is active`);
-          // Nothing to write unless a note or a non-default quantity was given.
-          if (notes !== null || String(quantity) !== "1") {
-            existingItem.quantity = quantity;
-            if (notes !== null) {
-              existingItem.details = notes;
-            }
+          if (notes !== null) {
+            existingItem.details = notes;
             // Awaited: unawaited, a failed save is reported as success, and the
             // rejection, unhandled, ends the Node process — which start.sh
             // answers by stopping the whole container.
             await existingItem.save();
           }
           outcome = "already";
+        }
+        if (newQuantity !== null) {
+          await existingItem.setQuantity(newQuantity);
         }
       } else {
         // Item doesn't exist, create new one
@@ -200,7 +204,7 @@ class AnyListClient {
       }
 
       if (store) {
-        await this.setItemStore(itemName, store);
+        await this.setItemStores(itemName, [store], { add: true });
       }
       return outcome;
 
@@ -329,8 +333,11 @@ class AnyListClient {
         if (includeNotes && item.details) {
           result.note = item.details;
         }
-        const store = (this.targetList.stores || []).find(s => s.identifier === item.storeIds[0]);
-        result.store = store ? store.name : null;
+        const stores = (item.storeIds || [])
+          .map(id => (this.targetList.stores || []).find(s => s.identifier === id))
+          .filter(Boolean)
+          .map(s => s.name);
+        result.store = stores.length ? stores.join(", ") : null;
         
         return result;
       });
@@ -372,7 +379,11 @@ class AnyListClient {
     return this.targetList.stores || [];
   }
 
-  async setItemStore(itemName, storeName) {
+  // Sets an item's stores to exactly `storeNames` (empty clears them), or with
+  // `add` adds them to the ones it has. An item can be at several stores, so
+  // replacing is never silent: the result names what was removed. Names come
+  // back in AnyList's spelling, not the caller's.
+  async setItemStores(itemName, storeNames, { add = false } = {}) {
     if (!this.targetList) {
       throw new Error('Not connected to any list. Call connect() first.');
     }
@@ -380,19 +391,49 @@ class AnyListClient {
     if (!item) {
       throw new Error(`Item "${itemName}" not found in list`);
     }
-    let storeIds = [];
-    let store = null;
-    if (storeName) {
-      store = (this.targetList.stores || []).find(s => storeNameKey(s.name) === storeNameKey(storeName));
+    const stores = this.targetList.stores || [];
+    const wanted = storeNames.filter(Boolean).map(name => {
+      const store = stores.find(s => storeNameKey(s.name) === storeNameKey(name));
       if (!store) {
-        const available = (this.targetList.stores || []).map(s => s.name).join(', ') || 'none';
-        throw new Error(`Store "${storeName}" not found. Available stores: ${available}`);
+        const available = stores.map(s => s.name).join(', ') || 'none';
+        throw new Error(`Store "${name}" not found. Available stores: ${available}`);
       }
-      storeIds = [store.identifier];
-    }
+      return store.identifier;
+    });
+    const current = item.storeIds || [];
+    const storeIds = [...new Set(add ? [...current, ...wanted] : wanted)];
+    const nameOf = id => (stores.find(s => s.identifier === id) || {}).name || id;
     await item.setStores(storeIds);
-    // AnyList's spelling of the store, not the caller's, for anything reported back.
-    return store ? store.name : null;
+    return {
+      stores: storeIds.map(nameOf),
+      removed: current.filter(id => !storeIds.includes(id)).map(nameOf),
+    };
+  }
+
+  // Changes an item already on the list. Fields left undefined are untouched.
+  // A new name that another item already has is refused: every lookup here is
+  // by name, so two items sharing one would make the second unreachable.
+  async updateItem(itemName, { newName, quantity, notes } = {}) {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    const item = this.targetList.getItemByName(itemName);
+    if (!item) {
+      throw new Error(`Item "${itemName}" not found in list`);
+    }
+    if (newName !== undefined) {
+      const cleanName = String(newName).trim();
+      if (!cleanName) throw new Error('New name is required.');
+      const other = this.targetList.getItemByName(cleanName);
+      if (other && other !== item) {
+        throw new Error(`An item named "${other.name}" is already on the list${other.checked ? " (checked off)" : ""}`);
+      }
+      item.name = cleanName;
+    }
+    if (notes !== undefined) item.details = notes;
+    if (newName !== undefined || notes !== undefined) await item.save();
+    if (quantity !== undefined) await item.setQuantity(quantity);
+    return item.name;
   }
 
   findStore(storeName) {

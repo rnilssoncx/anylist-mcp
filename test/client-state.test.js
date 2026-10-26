@@ -56,7 +56,25 @@ test('re-adding a checked-off item fails when its save fails', async () => {
 test('re-adding an item already on the list fails when its save fails', async () => {
   const c = oneItem({ name: 'Milk', checked: false, save: failingSave });
   await c.connect('Groceries');
+  await assert.rejects(c.addItem('Milk', 1, 'organic'), /Failed to add item "Milk": save refused/);
+});
+
+test('re-adding an item already on the list fails when its quantity write fails', async () => {
+  const c = oneItem({ name: 'Milk', checked: false, setQuantity: failingSave });
+  await c.connect('Groceries');
   await assert.rejects(c.addItem('Milk', 2), /Failed to add item "Milk": save refused/);
+});
+
+test('re-adding an item sends its quantity through setQuantity, and leaves it alone for the default', async () => {
+  const quantities = [];
+  const item = { name: 'Milk', checked: true, save: async () => {}, setQuantity: async q => { quantities.push(q); } };
+  const c = oneItem(item);
+  await c.connect('Groceries');
+  await c.addItem('Milk', '2 gallons');
+  await c.addItem('Milk', 1);
+  assert.deepEqual(quantities, ['2 gallons']);
+  // The legacy field is what never reached the apps; nothing may write it.
+  assert.equal(c.targetList.items[0].quantity, undefined);
 });
 
 test('addItem says what happened, and writes nothing for a plain re-add of a listed item', async () => {
@@ -87,16 +105,50 @@ test('connect logs in without the websocket', async () => {
   assert.deepEqual(seen, [[false]]);
 });
 
-test('setItemStore matches a store name regardless of case and apostrophe', async () => {
-  let set = null;
-  const item = { name: 'Dumplings', storeIds: [], setStores: async ids => { set = ids; } };
+function storesFixture(storeIds) {
+  const set = [];
+  const item = { name: 'Chips', storeIds, setStores: async ids => { set.push(ids); } };
   const c = connected(library(() => [{
     name: 'Groceries', items: [item],
-    stores: [{ name: 'Trader Joe’s', identifier: 'tj' }, { name: 'H.E.B.', identifier: 'heb' }],
+    stores: [{ name: 'Trader Joe’s', identifier: 'tj' }, { name: 'H.E.B.', identifier: 'heb' }, { name: 'Kroger', identifier: 'kr' }],
   }]));
+  return { c, set };
+}
+
+test('setItemStores matches a store name regardless of case and apostrophe', async () => {
+  const { c, set } = storesFixture([]);
   await c.connect('Groceries');
-  assert.equal(await c.setItemStore('Dumplings', "trader joe's"), 'Trader Joe’s');
-  assert.deepEqual(set, ['tj']);
+  assert.deepEqual(await c.setItemStores('Chips', ["trader joe's"]), { stores: ['Trader Joe’s'], removed: [] });
+  assert.deepEqual(set, [['tj']]);
+});
+
+test('setItemStores replaces the stores and names the ones it removed', async () => {
+  const { c, set } = storesFixture(['heb', 'kr']);
+  await c.connect('Groceries');
+  assert.deepEqual(await c.setItemStores('Chips', ['Kroger', 'Trader Joe’s']), { stores: ['Kroger', 'Trader Joe’s'], removed: ['H.E.B.'] });
+  assert.deepEqual(set, [['kr', 'tj']]);
+});
+
+test('setItemStores with add keeps the stores an item already has', async () => {
+  const { c, set } = storesFixture(['heb', 'kr']);
+  await c.connect('Groceries');
+  assert.deepEqual(await c.setItemStores('Chips', ['Trader Joe’s'], { add: true }), { stores: ['H.E.B.', 'Kroger', 'Trader Joe’s'], removed: [] });
+  assert.deepEqual(set, [['heb', 'kr', 'tj']]);
+});
+
+test('re-adding an item with a store adds it to the stores the item has', async () => {
+  const { c, set } = storesFixture(['heb', 'kr']);
+  await c.connect('Groceries');
+  c.targetList.items[0].checked = true;
+  c.targetList.items[0].save = async () => {};
+  await c.addItem('Chips', 1, null, 'other', 'Trader Joe’s');
+  assert.deepEqual(set, [['heb', 'kr', 'tj']]);
+});
+
+test('getItems shows every store an item is at', async () => {
+  const { c } = storesFixture(['heb', 'kr']);
+  await c.connect('Groceries');
+  assert.equal((await c.getItems(true))[0].store, 'H.E.B., Kroger');
 });
 
 test('removeItem says whether it checked anything off, and saves only when it did', async () => {

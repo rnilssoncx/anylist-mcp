@@ -190,35 +190,35 @@ export async function runShoppingItemsTests() {
     }
   });
 
-  await test('setItemStore assigns store to item (skips if no stores configured)', async () => {
+  await test('setItemStores assigns store to item (skips if no stores configured)', async () => {
     const stores = client.getStores();
     if (stores.length === 0) {
       console.log('    ⚠ No stores configured — skipping store assignment test');
       return;
     }
     await client.addItem(ITEM_STORE, 1);
-    await client.setItemStore(ITEM_STORE, stores[0].name);
+    await client.setItemStores(ITEM_STORE, [stores[0].name]);
     const items = await client.getItems(false, false, true);
     const item = items.find(i => i.name === ITEM_STORE);
-    if (!item) throw new Error('Item not found after setItemStore');
+    if (!item) throw new Error('Item not found after setItemStores');
     if (item.store !== stores[0].name) throw new Error(`Expected store "${stores[0].name}", got "${item.store}"`);
   });
 
-  await test('setItemStore with null clears store (skips if no stores configured)', async () => {
+  await test('setItemStores with null clears store (skips if no stores configured)', async () => {
     const stores = client.getStores();
     if (stores.length === 0) return;
-    await client.setItemStore(ITEM_STORE, null);
+    await client.setItemStores(ITEM_STORE, []);
     const items = await client.getItems(false, false, true);
     const item = items.find(i => i.name === ITEM_STORE);
     if (!item) throw new Error('Item not found after clearing store');
     if (item.store) throw new Error(`Store should be cleared, got "${item.store}"`);
   });
 
-  await test('setItemStore with unknown store name throws helpful error', async () => {
+  await test('setItemStores with unknown store name throws helpful error', async () => {
     await client.addItem(ITEM_STORE, 1);
     let threw = false;
     try {
-      await client.setItemStore(ITEM_STORE, '🚫 No Such Store');
+      await client.setItemStores(ITEM_STORE, ['🚫 No Such Store']);
     } catch (e) {
       threw = true;
       if (!e.message.includes('not found')) throw new Error(`Expected "not found" in error, got: ${e.message}`);
@@ -236,7 +236,7 @@ export async function runShoppingItemsTests() {
       () => dc.deleteItem('x'),
       () => dc.getItems(),
       () => dc.getStores(),
-      () => dc.setItemStore('x', 'y'),
+      () => dc.setItemStores('x', ['y']),
     ];
     for (const op of ops) {
       let threw = false;

@@ -41,6 +41,11 @@ describe('shopping dispatch', () => {
     const { tools } = await mcp.listTools();
     const actions = tools.find(t => t.name === 'shopping').inputSchema.properties.action.enum;
     assert.ok(actions.includes('set_item_store'), 'the schema this test reads has changed shape');
+    // The handler tests call the handler directly, so an action dropped from
+    // the schema — unreachable for any client — passes all of them.
+    for (const action of ['update_item', 'create_store', 'rename_store', 'delete_store']) {
+      assert.ok(actions.includes(action), `${action} is not in the schema`);
+    }
 
     const hung = [];
     for (const action of actions) {
@@ -77,14 +82,29 @@ describe('set_item_store', () => {
 
   it('assigns a store, resolving a partial item name', async () => {
     const result = await handlers.shopping({ action: 'set_item_store', name: 'dark soy', store_name: 'H.E.B.' });
-    assert.equal(result.content[0].text, 'Assigned "Pearl River Bridge Superior Dark Soy Sauce" to store "H.E.B."');
-    assert.equal(client._items[0].store, 'H.E.B.');
+    assert.equal(result.content[0].text, 'Stores for "Pearl River Bridge Superior Dark Soy Sauce": H.E.B.');
+    assert.deepEqual(client._items[0].stores, ['H.E.B.']);
   });
 
-  it('clears the store when none is given', async () => {
-    client._items[0].store = 'H.E.B.';
+  it('sets several stores, and names the one it removed', async () => {
+    client._stores.push({ name: 'Kroger' });
+    client._items[0].stores = ['Kroger'];
+    const result = await handlers.shopping({ action: 'set_item_store', name: 'dark soy', store_names: ['h.e.b.', "trader joe's"] });
+    assert.equal(result.content[0].text, 'Stores for "Pearl River Bridge Superior Dark Soy Sauce": H.E.B., Trader Joe’s (removed: Kroger)');
+    assert.deepEqual(client._items[0].stores, ['H.E.B.', 'Trader Joe’s']);
+  });
+
+  it('refuses the whole set when one store is unknown', async () => {
+    const result = await handlers.shopping({ action: 'set_item_store', name: 'dark soy', store_names: ['H.E.B.', 'Costco'] });
+    assert.equal(result.isError, true);
+    assert.ok(result.content[0].text.startsWith('Store "Costco" not found in list'));
+    assert.equal(client._items[0].stores, undefined);
+  });
+
+  it('clears the stores when none is given, and names them', async () => {
+    client._items[0].stores = ['H.E.B.', 'Trader Joe’s'];
     const result = await handlers.shopping({ action: 'set_item_store', name: 'Pearl River Bridge Superior Dark Soy Sauce' });
-    assert.equal(result.content[0].text, 'Cleared the store for "Pearl River Bridge Superior Dark Soy Sauce"');
+    assert.equal(result.content[0].text, 'Cleared the stores for "Pearl River Bridge Superior Dark Soy Sauce" (removed: H.E.B., Trader Joe’s)');
     assert.equal(client._items[0].store, null);
   });
 
@@ -97,12 +117,12 @@ describe('set_item_store', () => {
 
   it('accepts a store name typed with a straight apostrophe and any case', async () => {
     const result = await handlers.shopping({ action: 'set_item_store', name: 'dark soy', store_name: "trader joe's" });
-    assert.equal(result.isError, undefined);
+    assert.equal(result.content[0].text, 'Stores for "Pearl River Bridge Superior Dark Soy Sauce": Trader Joe’s');
   });
 
   it("reports the store in AnyList's spelling, not the caller's", async () => {
     const result = await handlers.shopping({ action: 'set_item_store', name: 'dark soy', store_name: 'h.e.b.' });
-    assert.equal(result.content[0].text, 'Assigned "Pearl River Bridge Superior Dark Soy Sauce" to store "H.E.B."');
+    assert.equal(result.content[0].text, 'Stores for "Pearl River Bridge Superior Dark Soy Sauce": H.E.B.');
   });
 });
 
@@ -128,10 +148,10 @@ describe('what add reports', () => {
     handlers = h;
   });
 
-  it('says an item was already on the list, and that a quantity did not reach it', async () => {
+  it('says an item was already on the list', async () => {
     client._addOutcome = 'already';
     const result = await handlers.shopping({ action: 'add_item', name: 'Milk', quantity: 2, exact: true });
-    assert.equal(result.content[0].text, '"Milk" is already on list "Test List". Its quantity was not changed: this server can set a quantity only on an item it creates. To change it, delete the item and add it again with the quantity.');
+    assert.equal(result.content[0].text, '"Milk" is already on list "Test List".');
   });
 
   it('says a checked-off item is back on the list, with no quantity caveat when none was given', async () => {
@@ -140,10 +160,10 @@ describe('what add reports', () => {
     assert.equal(result.content[0].text, 'Successfully added "Milk" to list "Test List" (it was checked off; it is back on the list).');
   });
 
-  it('marks each add_items entry that was already there or lost its quantity', async () => {
+  it('marks each add_items entry that was already there', async () => {
     client._addOutcome = 'already';
     const result = await handlers.shopping({ action: 'add_items', items: [{ name: 'Milk', quantity: 3, exact: true }] });
-    assert.ok(result.content[0].text.includes('✓ Milk (already on the list) — quantity not changed; delete and re-add to change it'));
+    assert.ok(result.content[0].text.split('\n').includes('  ✓ Milk (already on the list)'));
   });
 
   it('re-uses a typed item of the same name rather than adding the scanned product beside it', async () => {

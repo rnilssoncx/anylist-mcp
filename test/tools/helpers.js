@@ -7,6 +7,7 @@
  * MockAnyListClient — in-memory client that owns its own state arrays.
  *   Call client.reset() (or create a fresh instance) in beforeEach.
  */
+import { storeNameKey } from '../../src/anylist-client.js';
 
 export function createMockServer() {
   const handlers = {};
@@ -130,13 +131,28 @@ export class MockAnyListClient {
     }));
   }
 
-  async setItemStore(name, store) {
+  // Mirrors AnyListClient.setItemStores, whose own behaviour is tested in
+  // client-state.test.js: replace or add, report what was removed, names in
+  // the mock stores' spelling.
+  async setItemStores(name, storeNames, { add = false } = {}) {
     const item = this._items.find(i => i.name === name);
     if (!item) throw new Error(`Item "${name}" not found in list`);
-    // The real client returns AnyList's spelling; the mock's stores carry it.
-    const canonical = store ? ((this._stores || []).find(s => s.name.toLowerCase() === store.toLowerCase())?.name ?? store) : null;
-    item.store = canonical;
-    return canonical;
+    const canon = n => (this._stores || []).find(s => storeNameKey(s.name) === storeNameKey(n))?.name ?? n;
+    const current = item.stores || (item.store ? [item.store] : []);
+    const wanted = storeNames.filter(Boolean).map(canon);
+    const stores = [...new Set(add ? [...current, ...wanted] : wanted)];
+    item.stores = stores;
+    item.store = stores.length ? stores.join(', ') : null;
+    return { stores, removed: current.filter(s => !stores.includes(s)) };
+  }
+
+  async updateItem(name, { newName, quantity, notes } = {}) {
+    const item = this._items.find(i => i.name === name);
+    if (!item) throw new Error(`Item "${name}" not found in list`);
+    if (newName !== undefined) item.name = newName;
+    if (quantity !== undefined) item.quantity = quantity;
+    if (notes !== undefined) item.notes = notes;
+    return item.name;
   }
 
   async createStore(name) {

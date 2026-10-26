@@ -17,7 +17,8 @@ function buildDescription(stores) {
 - list_items: Show items on a list (grouped by category)
 - add_item: Add an item to a list. A name is matched against items already saved on the list (specific products, often scanned): one match is re-added, several are listed back without adding anything — ask which one, or resend with exact: true
 - add_items: Add several items to a list in one call (use this instead of repeating add_item); entries are matched the same way
-- set_item_store: Assign or clear the store for an item already on the list
+- update_item: Change an item already on the list — its name (new_name), quantity or notes. Its stores, barcode and photo are kept
+- set_item_store: Set the stores for an item already on the list (store_names, or store_name for one); an empty list clears them. This replaces the item's stores — list_items shows the ones it has, and the reply names any removed
 - check_item: Check off (complete) an item
 - uncheck_item: Uncheck a previously checked-off item (make it active again)
 - delete_item: Permanently remove an item from a list
@@ -37,9 +38,11 @@ function buildDescription(stores) {
 async function validateStoreName(client, storeName) {
   if (!storeName) return { valid: true, message: null };
   const stores = client.getStores();
-  if (!stores.some(s => storeNameKey(s.name) === storeNameKey(storeName))) {
-    return { valid: false, message: `Store "${storeName}" not found in list "${client.targetList.name}". Available stores: ${stores.map(s => s.name).join(", ")}.
+  for (const name of [].concat(storeName)) {
+    if (!stores.some(s => storeNameKey(s.name) === storeNameKey(name))) {
+      return { valid: false, message: `Store "${name}" not found in list "${client.targetList.name}". Available stores: ${stores.map(s => s.name).join(", ")}.
     Use create_store to add it, then try again.` };
+    }
   }
   return { valid: true, message: null };
 }
@@ -113,17 +116,10 @@ export function register(server, getClient) {
     return `AnyList has no product for barcode ${upc}. Its database has no match — that does not mean the product doesn't exist.`;
   }
 
-  // What add_item reports, by what addItem says happened. A quantity reaches
-  // the apps only on an item this server creates (see the note on addItem), so
-  // saying "added" with "2" when the list still shows one would be a false
-  // report the household acts on.
-  function addedText(name, listName, outcome, quantity) {
-    const qtyLost = quantity != null && String(quantity) !== "1" && outcome !== "added";
-    const lost = qtyLost
-      ? ` Its quantity was not changed: this server can set a quantity only on an item it creates. To change it, delete the item and add it again with the quantity.`
-      : "";
-    if (outcome === "already") return `"${name}" is already on list "${listName}".${lost}`;
-    if (outcome === "rechecked") return `Successfully added "${name}" to list "${listName}" (it was checked off; it is back on the list).${lost}`;
+  // What add_item reports, by what addItem says happened.
+  function addedText(name, listName, outcome) {
+    if (outcome === "already") return `"${name}" is already on list "${listName}".`;
+    if (outcome === "rechecked") return `Successfully added "${name}" to list "${listName}" (it was checked off; it is back on the list).`;
     return `Successfully added "${name}" to list "${listName}"`;
   }
 
@@ -148,11 +144,12 @@ export function register(server, getClient) {
     description: buildDescription([]),
     inputSchema: {
       action: z.enum(["list_lists", "list_items", "add_item", "add_items",
-        "set_item_store", "check_item", "uncheck_item", "delete_item", "get_favorites", "get_recents", "list_stores",
+        "update_item", "set_item_store", "check_item", "uncheck_item", "delete_item", "get_favorites", "get_recents", "list_stores",
         "create_store", "rename_store", "delete_store", "lookup_upc", "add_by_upc"]).describe("The shopping action to perform"),
       upc: z.string().optional().describe("Barcode digits (lookup_upc and add_by_upc only)"),
       list_name: z.string().optional().describe("Name of the list (defaults to configured default list)"),
-      name: z.string().optional().describe("Item name (required for add_item, set_item_store, check_item, uncheck_item, delete_item)"),
+      name: z.string().optional().describe("Item name (required for add_item, update_item, set_item_store, check_item, uncheck_item, delete_item)"),
+      new_name: z.string().optional().describe("The item's new name (update_item only)"),
       items: z.array(z.union([
         z.string(),
         z.object({
@@ -165,12 +162,13 @@ export function register(server, getClient) {
         })
       ])).optional().describe("Items to add (add_items only). Each entry is either a plain item name or an object with name/quantity/notes/category/store_name/exact"),
       exact: z.boolean().optional().describe("Add the name exactly as given, without matching saved items (add_item only). Use after the person has chosen, or said to add it as written"),
-      quantity: z.union([z.number().min(1), z.string().min(1)]).optional().describe("Item quantity, e.g. 2 or \"500 g\" (add_item only, defaults to 1)"),
-      notes: z.string().optional().describe("Notes for the item (add_item only)"),
+      quantity: z.union([z.number().min(1), z.string().min(1)]).optional().describe("Item quantity, e.g. 2 or \"500 g\" (add_item and update_item; add_item defaults to 1)"),
+      notes: z.string().optional().describe("Notes for the item (add_item and update_item; an empty string clears them on update_item)"),
       include_checked: z.boolean().optional().describe("Include checked-off items (list_items only, default false)"),
       include_notes: z.boolean().optional().describe("Include notes for each item (list_items only, default false)"),
       category: z.enum(valid_categories).optional().describe("Category for the item (add_item only, defaults to 'other')"),
-      store_name: z.string().optional().describe("Store to assign to this item (add_item and set_item_store; omit or leave blank to clear), or the store to create, rename or delete (create_store, rename_store, delete_store)"),
+      store_name: z.string().optional().describe("A store for this item (add_item adds it to the item's stores; set_item_store sets it as the only one, or clears them if blank), or the store to create, rename or delete (create_store, rename_store, delete_store)"),
+      store_names: z.array(z.string()).optional().describe("Every store for this item (set_item_store only; replaces store_name; an empty array clears them)"),
       new_store_name: z.string().optional().describe("The store's new name (rename_store only)"),
     }
   }, async (params) => {
@@ -253,7 +251,7 @@ export function register(server, getClient) {
           }
 
           const outcome = await client.addItem(resolved.name, quantity || 1, notes || null, params.category || "other", params.store_name || null);
-          return textResponse(addedText(resolved.name, client.targetList.name, outcome, quantity));
+          return textResponse(addedText(resolved.name, client.targetList.name, outcome));
         }
         case "add_items": {
           const entries = params.items;
@@ -276,10 +274,8 @@ export function register(server, getClient) {
                 continue;
               }
               const outcome = await client.addItem(resolved.name, item.quantity || 1, item.notes || null, item.category || "other", item.store_name || null);
-              const qtyLost = item.quantity != null && String(item.quantity) !== "1" && outcome !== "added";
               added.push(resolved.name
-                + (outcome === "already" ? " (already on the list)" : outcome === "rechecked" ? " (was checked off)" : "")
-                + (qtyLost ? " — quantity not changed; delete and re-add to change it" : ""));
+                + (outcome === "already" ? " (already on the list)" : outcome === "rechecked" ? " (was checked off)" : ""));
             } catch (error) {
               failed.push(`${item.name}: ${error.message}`);
             }
@@ -316,7 +312,7 @@ export function register(server, getClient) {
           const saved = client.findItemByUpc(upc);
           if (saved) {
             const outcome = await client.addItem(saved.name, quantity || 1, notes || null, "other", params.store_name || null);
-            return textResponse(`${addedText(saved.name, client.targetList.name, outcome, quantity)} (already saved with barcode ${upc})`);
+            return textResponse(`${addedText(saved.name, client.targetList.name, outcome)} (already saved with barcode ${upc})`);
           }
 
           const product = await client.lookupUpc(upc);
@@ -328,23 +324,42 @@ export function register(server, getClient) {
           // "Whole Milk"s, and the store then went to whichever came first.
           if (client.targetList.getItemByName(product.name)) {
             const outcome = await client.addItem(product.name, quantity || 1, notes || null, "other", params.store_name || null);
-            return textResponse(`${addedText(product.name, client.targetList.name, outcome, quantity)} (barcode ${upc} is that product; the item already on the list was used)`);
+            return textResponse(`${addedText(product.name, client.targetList.name, outcome)} (barcode ${upc} is that product; the item already on the list was used)`);
           }
           await client.addProduct(product, quantity || 1, notes || null);
-          if (params.store_name) await client.setItemStore(product.name, params.store_name);
+          if (params.store_name) await client.setItemStores(product.name, [params.store_name], { add: true });
           return textResponse(`Successfully added "${product.name}" to list "${client.targetList.name}" from barcode ${upc}`);
+        }
+        case "update_item": {
+          let itemName = name;
+          if (!itemName) itemName = await elicitRequiredField("name", "Which item would you like to change?");
+          const changes = { newName: params.new_name, quantity, notes };
+          if (Object.values(changes).every(v => v === undefined)) {
+            return errorResponse(`Nothing to change: give new_name, quantity or notes`);
+          }
+          await client.connect(list_name);
+          const resolved = await resolveItemName(client, itemName);
+          const finalName = await client.updateItem(resolved, changes);
+          const done = [
+            changes.newName !== undefined && `renamed to "${finalName}"`,
+            quantity !== undefined && `quantity ${quantity}`,
+            notes !== undefined && (notes ? `notes "${notes}"` : "notes cleared"),
+          ].filter(Boolean);
+          return textResponse(`Updated "${resolved}": ${done.join(", ")}`);
         }
         case "set_item_store": {
           let itemName = name;
           if (!itemName) itemName = await elicitRequiredField("name", "Which item would you like to assign to a store?");
           await client.connect(list_name);
-          const { valid, message } = await validateStoreName(client, params.store_name);
+          const storeNames = params.store_names ?? (params.store_name ? [params.store_name] : []);
+          const { valid, message } = await validateStoreName(client, storeNames);
           if (!valid) return errorResponse(message);
           const resolved = await resolveItemName(client, itemName);
-          const store = await client.setItemStore(resolved, params.store_name || null);
-          return textResponse(store
-            ? `Assigned "${resolved}" to store "${store}"`
-            : `Cleared the store for "${resolved}"`);
+          const { stores, removed } = await client.setItemStores(resolved, storeNames);
+          const was = removed.length ? ` (removed: ${removed.join(", ")})` : "";
+          return textResponse(stores.length
+            ? `Stores for "${resolved}": ${stores.join(", ")}${was}`
+            : `Cleared the stores for "${resolved}"${was}`);
         }
         case "check_item": {
           let itemName = name;
