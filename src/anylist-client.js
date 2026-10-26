@@ -32,11 +32,6 @@ class AnyListClient {
       throw error;
     }
 
-    // If already connected to the same list, skip reconnection
-    if (this.client && this.targetList && this.targetList.name === targetListName) {
-      return true;
-    }
-
     try {
       // Create AnyList client if not already authenticated
       if (!this.client) {
@@ -49,9 +44,15 @@ class AnyListClient {
         console.error(`Connecting to AnyList as ${username}...`);
         await this.client.login();
         console.error('Successfully authenticated with AnyList');
-
-        await this.client.getLists();
       }
+
+      // Re-read the lists on every call. The HTTP server keeps one client per
+      // user for as long as it is used, and the library's websocket refresh was
+      // measured not to reach it: a store changed from another login was still
+      // the old one here half an hour later, and a write resolves names against
+      // the same copy. One request per call is the price of answering from what
+      // the list holds now rather than what it held when the session began.
+      await this.client.getLists();
 
       // Find the target list
       console.error(`Looking for list: "${targetListName}"`);
@@ -148,7 +149,7 @@ class AnyListClient {
           }
 
           console.error(`Unchecked existing item: ${existingItem.name}`);
-          existingItem.save();
+          await existingItem.save();
         } else {
 
           // Item already exists and is unchecked, no action needed
@@ -159,7 +160,10 @@ class AnyListClient {
           }
           // Category not used if item already has a category
 
-          existingItem.save();
+          // Awaited: unawaited, a failed save is reported as success, and the
+          // rejection, unhandled, ends the Node process — which start.sh answers
+          // by stopping the whole container.
+          await existingItem.save();
         }
       } else {
         // Item doesn't exist, create new one
@@ -363,7 +367,7 @@ class AnyListClient {
     }
     let storeIds = [];
     if (storeName) {
-      const store = this.targetList.findStoreByName(storeName);
+      const store = (this.targetList.stores || []).find(s => storeNameKey(s.name) === storeNameKey(storeName));
       if (!store) {
         const available = (this.targetList.stores || []).map(s => s.name).join(', ') || 'none';
         throw new Error(`Store "${storeName}" not found. Available stores: ${available}`);
@@ -870,6 +874,16 @@ class AnyListClient {
     this.client = null;
     this.targetList = null;
   }
+}
+
+/**
+ * How a store name is compared. The tool's check and the write must agree, or
+ * "h.e.b." passes the check, the item is added, and the store lookup then fails
+ * with the item already on the list. Case is ignored, and a curly apostrophe
+ * matches a straight one: AnyList stores "Trader Joe’s", and nobody types that.
+ */
+export function storeNameKey(name) {
+  return String(name).trim().toLowerCase().replace(/[\u2018\u2019]/g, "'");
 }
 
 export default AnyListClient;

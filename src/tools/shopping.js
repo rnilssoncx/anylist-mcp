@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { textResponse, errorResponse } from "./helpers.js";
 import { createElicitationHelpers } from "./elicitation.js";
+import { storeNameKey } from "../anylist-client.js";
 
 // Default categories recognized by anylist.
 const valid_categories = ["baby","bakery","beverages","breakfast-and-cereal","condiments-oils-and-salad-dressings",
@@ -16,6 +17,7 @@ function buildDescription(stores) {
 - list_items: Show items on a list (grouped by category)
 - add_item: Add an item to a list. A name is matched against items already saved on the list (specific products, often scanned): one match is re-added, several are listed back without adding anything — ask which one, or resend with exact: true
 - add_items: Add several items to a list in one call (use this instead of repeating add_item); entries are matched the same way
+- set_item_store: Assign or clear the store for an item already on the list
 - check_item: Check off (complete) an item
 - uncheck_item: Uncheck a previously checked-off item (make it active again)
 - delete_item: Permanently remove an item from a list
@@ -32,9 +34,8 @@ function buildDescription(stores) {
 async function validateStoreName(client, storeName) {
   if (!storeName) return { valid: true, message: null };
   const stores = client.getStores();
-  const storeNames = stores.map(s => s.name.toLowerCase());
-  if (!storeNames.includes(storeName.toLowerCase())) {
-    return { valid: false, message: `Store "${storeName}" not found in list "${client.targetList.name}". Available stores: ${storeNames.join(", ")}.
+  if (!stores.some(s => storeNameKey(s.name) === storeNameKey(storeName))) {
+    return { valid: false, message: `Store "${storeName}" not found in list "${client.targetList.name}". Available stores: ${stores.map(s => s.name).join(", ")}.
     Create a new store from the web application or mobile app, then try again.` };
   }
   return { valid: true, message: null };
@@ -295,6 +296,18 @@ export function register(server, getClient) {
           if (params.store_name) await client.setItemStore(product.name, params.store_name);
           return textResponse(`Successfully added "${product.name}" to list "${client.targetList.name}" from barcode ${upc}`);
         }
+        case "set_item_store": {
+          let itemName = name;
+          if (!itemName) itemName = await elicitRequiredField("name", "Which item would you like to assign to a store?");
+          await client.connect(list_name);
+          const { valid, message } = await validateStoreName(client, params.store_name);
+          if (!valid) return errorResponse(message);
+          const resolved = await resolveItemName(client, itemName);
+          await client.setItemStore(resolved, params.store_name || null);
+          return textResponse(params.store_name
+            ? `Assigned "${resolved}" to store "${params.store_name}"`
+            : `Cleared the store for "${resolved}"`);
+        }
         case "check_item": {
           let itemName = name;
           if (!itemName) itemName = await elicitRequiredField("name", "What item would you like to check off?");
@@ -340,6 +353,12 @@ export function register(server, getClient) {
           const list = stores.map(s => `- ${s.name}`).join('\n');
           return textResponse(`Stores for "${client.targetList.name}" (${stores.length}):\n${list}`);
         }
+        default:
+          // An action the schema admits but nothing handles must still answer.
+          // Falling off the switch returns undefined, and the caller then waits
+          // forever — upstream removed set_item_store's case but not its enum
+          // entry, and a call to it hung a live conversation.
+          return errorResponse(`Unknown shopping action "${action}"`);
       }
     } catch (error) {
       return errorResponse(`Shopping ${action} failed: ${error.message}`);

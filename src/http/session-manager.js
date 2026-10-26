@@ -45,15 +45,19 @@ export async function getOrCreateSession(userId) {
  */
 export function evictSession(userId) {
   const session = sessions.get(userId);
-  if (session) {
-    clearTimeout(session.timer);
-    sessions.delete(userId);
-  }
+  if (session) endSession(userId, session);
 }
 
 function resetIdleTimer(userId, session) {
   clearTimeout(session.timer);
-  session.timer = setTimeout(() => {
-    sessions.delete(userId);
-  }, IDLE_TIMEOUT_MS);
+  session.timer = setTimeout(() => endSession(userId, session), IDLE_TIMEOUT_MS);
+}
+
+// Dropping the map entry alone left the client logged in, its websocket open
+// and heartbeating every five seconds, for as long as the process ran — one
+// more after every idle half hour.
+function endSession(userId, session) {
+  clearTimeout(session.timer);
+  sessions.delete(userId);
+  session.client.disconnect().catch(err => console.error(`Ending AnyList session: ${err.message}`));
 }
