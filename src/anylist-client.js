@@ -395,33 +395,51 @@ class AnyListClient {
     return store ? store.name : null;
   }
 
-  async createStore(storeName) {
-    if (!this.targetList) {
-      throw new Error('Not connected to any list. Call connect() first.');
-    }
-    try {
-      const store = await this.targetList.createStore(storeName);
-      console.error(`Created store: ${store.name}`);
-      return store;
-    } catch (error) {
-      throw new Error(`Failed to create store "${storeName}": ${error.message}`);
-    }
+  findStore(storeName) {
+    return this.getStores().find(s => storeNameKey(s.name) === storeNameKey(storeName)) || null;
   }
 
-  async deleteStore(storeName) {
-    if (!this.targetList) {
-      throw new Error('Not connected to any list. Call connect() first.');
+  // Store names are matched the way set_item_store matches them, so a store
+  // that "h.e.b." would find is one that "H.E.B." cannot be created beside.
+  async createStore(storeName) {
+    const existing = this.findStore(storeName);
+    if (existing) {
+      throw new Error(`Store "${existing.name}" already exists`);
     }
-    const store = this.targetList.findStoreByName(storeName);
+    return this.targetList.createStore(storeName);
+  }
+
+  async renameStore(storeName, newName) {
+    const store = this.findStore(storeName);
     if (!store) {
-      throw new Error(`Store "${storeName}" not found`);
+      const available = this.getStores().map(s => s.name).join(', ') || 'none';
+      throw new Error(`Store "${storeName}" not found. Available stores: ${available}`);
     }
-    try {
-      await this.targetList.deleteStore(store.identifier);
-      console.error(`Deleted store: ${storeName}`);
-    } catch (error) {
-      throw new Error(`Failed to delete store "${storeName}": ${error.message}`);
+    const clash = this.findStore(newName);
+    if (clash && clash.identifier !== store.identifier) {
+      throw new Error(`Store "${clash.name}" already exists`);
     }
+    const oldName = store.name;
+    await this.targetList.renameStore(store.identifier, newName);
+    return { oldName, newName: store.name };
+  }
+
+  // Returns which items were assigned to it, which the deletion leaves without
+  // a store: active ones by name, saved (checked-off) ones as a count, since a
+  // list's history can run to dozens.
+  async deleteStore(storeName) {
+    const store = this.findStore(storeName);
+    if (!store) {
+      const available = this.getStores().map(s => s.name).join(', ') || 'none';
+      throw new Error(`Store "${storeName}" not found. Available stores: ${available}`);
+    }
+    const assigned = (this.targetList.items || []).filter(i => (i.storeIds || []).includes(store.identifier));
+    await this.targetList.deleteStore(store.identifier);
+    return {
+      name: store.name,
+      activeItems: assigned.filter(i => !i.checked).map(i => i.name),
+      savedCount: assigned.filter(i => i.checked).length,
+    };
   }
 
   // ===== RECIPES =====

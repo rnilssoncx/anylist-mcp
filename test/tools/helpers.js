@@ -139,6 +139,28 @@ export class MockAnyListClient {
     return canonical;
   }
 
+  async createStore(name) {
+    const store = { identifier: `store-${this._stores.length + 1}`, name };
+    this._stores.push(store);
+    return store;
+  }
+
+  async renameStore(name, newName) {
+    const store = this._stores.find(s => s.name.toLowerCase() === name.toLowerCase());
+    if (!store) throw new Error(`Store "${name}" not found`);
+    const oldName = store.name;
+    store.name = newName;
+    return { oldName, newName };
+  }
+
+  // `_deleteReport` sets which items the real client would say lost the store.
+  async deleteStore(name) {
+    const store = this._stores.find(s => s.name.toLowerCase() === name.toLowerCase());
+    if (!store) throw new Error(`Store "${name}" not found`);
+    this._stores = this._stores.filter(s => s !== store);
+    return { name: store.name, activeItems: [], savedCount: 0, ...this._deleteReport };
+  }
+
   async getFavoriteItems() { return this._favorites; }
   async getRecentItems() { return this._recents; }
 

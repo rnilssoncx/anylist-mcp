@@ -24,6 +24,9 @@ function buildDescription(stores) {
 - get_favorites: Get favorite items for a list
 - get_recents: Get recently added items for a list
 - list_stores: list stores available for the list (if any)
+- create_store: Add a store to the list (store_name)
+- rename_store: Rename a store (store_name, new_store_name); items assigned to it stay assigned
+- delete_store: Delete a store (store_name). Items assigned to it are left with no store, so confirm with the person first
 - lookup_upc: Say what product a barcode is, and whether it is already saved on the list
 - add_by_upc: Add a product by barcode. An item already saved with that barcode is re-added; otherwise the looked-up product is added with its barcode and photo`;
   if (!stores || stores.length === 0) return base;
@@ -36,7 +39,7 @@ async function validateStoreName(client, storeName) {
   const stores = client.getStores();
   if (!stores.some(s => storeNameKey(s.name) === storeNameKey(storeName))) {
     return { valid: false, message: `Store "${storeName}" not found in list "${client.targetList.name}". Available stores: ${stores.map(s => s.name).join(", ")}.
-    Create a new store from the web application or mobile app, then try again.` };
+    Use create_store to add it, then try again.` };
   }
   return { valid: true, message: null };
 }
@@ -130,13 +133,23 @@ export function register(server, getClient) {
 
   let lastStoreSignature = '';
 
+  // The description lists the stores, so a change to them has to reach it.
+  function refreshDescription(client) {
+    const stores = client.getStores();
+    const sig = stores.map(s => s.name).join(',');
+    if (sig !== lastStoreSignature) {
+      lastStoreSignature = sig;
+      registeredTool.update({ description: buildDescription(stores) });
+    }
+  }
+
   const registeredTool = server.registerTool("shopping", {
     title: "Shopping Lists & Items",
     description: buildDescription([]),
     inputSchema: {
       action: z.enum(["list_lists", "list_items", "add_item", "add_items",
         "set_item_store", "check_item", "uncheck_item", "delete_item", "get_favorites", "get_recents", "list_stores",
-        "lookup_upc", "add_by_upc"]).describe("The shopping action to perform"),
+        "create_store", "rename_store", "delete_store", "lookup_upc", "add_by_upc"]).describe("The shopping action to perform"),
       upc: z.string().optional().describe("Barcode digits (lookup_upc and add_by_upc only)"),
       list_name: z.string().optional().describe("Name of the list (defaults to configured default list)"),
       name: z.string().optional().describe("Item name (required for add_item, set_item_store, check_item, uncheck_item, delete_item)"),
@@ -157,7 +170,8 @@ export function register(server, getClient) {
       include_checked: z.boolean().optional().describe("Include checked-off items (list_items only, default false)"),
       include_notes: z.boolean().optional().describe("Include notes for each item (list_items only, default false)"),
       category: z.enum(valid_categories).optional().describe("Category for the item (add_item only, defaults to 'other')"),
-      store_name: z.string().optional().describe("Store to assign to this item (add_item and set_item_store only; omit or leave blank to clear)"),
+      store_name: z.string().optional().describe("Store to assign to this item (add_item and set_item_store; omit or leave blank to clear), or the store to create, rename or delete (create_store, rename_store, delete_store)"),
+      new_store_name: z.string().optional().describe("The store's new name (rename_store only)"),
     }
   }, async (params) => {
     const { action, list_name, name, quantity, notes, include_checked, include_notes, category } = params;
@@ -378,6 +392,35 @@ export function register(server, getClient) {
           if (stores.length === 0) return textResponse(`No stores found for list "${client.targetList.name}".`);
           const list = stores.map(s => `- ${s.name}`).join('\n');
           return textResponse(`Stores for "${client.targetList.name}" (${stores.length}):\n${list}`);
+        }
+        case "create_store": {
+          let storeName = params.store_name;
+          if (!storeName) storeName = await elicitRequiredField("store_name", "What should the new store be called?");
+          await client.connect(list_name || null);
+          const store = await client.createStore(storeName);
+          refreshDescription(client);
+          return textResponse(`Created store "${store.name}" on "${client.targetList.name}"`);
+        }
+        case "rename_store": {
+          let storeName = params.store_name;
+          if (!storeName) storeName = await elicitRequiredField("store_name", "Which store would you like to rename?");
+          let newName = params.new_store_name;
+          if (!newName) newName = await elicitRequiredField("new_store_name", `What should "${storeName}" be renamed to?`);
+          await client.connect(list_name || null);
+          const { oldName, newName: renamed } = await client.renameStore(storeName, newName);
+          refreshDescription(client);
+          return textResponse(`Renamed store "${oldName}" to "${renamed}"`);
+        }
+        case "delete_store": {
+          let storeName = params.store_name;
+          if (!storeName) storeName = await elicitRequiredField("store_name", "Which store would you like to delete?");
+          await client.connect(list_name || null);
+          const { name: deleted, activeItems, savedCount } = await client.deleteStore(storeName);
+          refreshDescription(client);
+          const lines = [`Deleted store "${deleted}" from "${client.targetList.name}"`];
+          if (activeItems.length) lines.push(`Now without a store: ${activeItems.join(", ")}`);
+          if (savedCount) lines.push(`${savedCount} saved item${savedCount === 1 ? "" : "s"} also lost the store`);
+          return textResponse(lines.join("\n"));
         }
         default:
           // An action the schema admits but nothing handles must still answer.
