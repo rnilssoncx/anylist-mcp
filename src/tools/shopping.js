@@ -110,6 +110,20 @@ export function register(server, getClient) {
     return `AnyList has no product for barcode ${upc}. Its database has no match — that does not mean the product doesn't exist.`;
   }
 
+  // What add_item reports, by what addItem says happened. A quantity reaches
+  // the apps only on an item this server creates (see the note on addItem), so
+  // saying "added" with "2" when the list still shows one would be a false
+  // report the household acts on.
+  function addedText(name, listName, outcome, quantity) {
+    const qtyLost = quantity != null && String(quantity) !== "1" && outcome !== "added";
+    const lost = qtyLost
+      ? ` Its quantity was not changed: this server can set a quantity only on an item it creates. To change it, delete the item and add it again with the quantity.`
+      : "";
+    if (outcome === "already") return `"${name}" is already on list "${listName}".${lost}`;
+    if (outcome === "rechecked") return `Successfully added "${name}" to list "${listName}" (it was checked off; it is back on the list).${lost}`;
+    return `Successfully added "${name}" to list "${listName}"`;
+  }
+
   function choicesText(itemName, choices) {
     return `Several saved items match "${itemName}":\n${choices.map(c => `  - ${c}`).join("\n")}`;
   }
@@ -224,8 +238,8 @@ export function register(server, getClient) {
             );
           }
 
-          await client.addItem(resolved.name, quantity || 1, notes || null, params.category || "other", params.store_name || null);
-          return textResponse(`Successfully added "${resolved.name}" to list "${client.targetList.name}"`);
+          const outcome = await client.addItem(resolved.name, quantity || 1, notes || null, params.category || "other", params.store_name || null);
+          return textResponse(addedText(resolved.name, client.targetList.name, outcome, quantity));
         }
         case "add_items": {
           const entries = params.items;
@@ -247,8 +261,11 @@ export function register(server, getClient) {
                 unresolved.push(choicesText(item.name, resolved.choices));
                 continue;
               }
-              await client.addItem(resolved.name, item.quantity || 1, item.notes || null, item.category || "other", item.store_name || null);
-              added.push(resolved.name);
+              const outcome = await client.addItem(resolved.name, item.quantity || 1, item.notes || null, item.category || "other", item.store_name || null);
+              const qtyLost = item.quantity != null && String(item.quantity) !== "1" && outcome !== "added";
+              added.push(resolved.name
+                + (outcome === "already" ? " (already on the list)" : outcome === "rechecked" ? " (was checked off)" : "")
+                + (qtyLost ? " — quantity not changed; delete and re-add to change it" : ""));
             } catch (error) {
               failed.push(`${item.name}: ${error.message}`);
             }
@@ -284,13 +301,20 @@ export function register(server, getClient) {
           // store and photo; re-adding it by name keeps all of that.
           const saved = client.findItemByUpc(upc);
           if (saved) {
-            await client.addItem(saved.name, quantity || 1, notes || null, "other", params.store_name || null);
-            return textResponse(`Successfully added "${saved.name}" to list "${client.targetList.name}" (already saved with barcode ${upc})`);
+            const outcome = await client.addItem(saved.name, quantity || 1, notes || null, "other", params.store_name || null);
+            return textResponse(`${addedText(saved.name, client.targetList.name, outcome, quantity)} (already saved with barcode ${upc})`);
           }
 
           const product = await client.lookupUpc(upc);
           if (!product) {
             return textResponse(`${noProductText(upc)}\nNothing was added. Ask what it is, or add it by name.`);
+          }
+          // An item of the same name, typed rather than scanned, is the same
+          // thing to the household. Creating the product beside it made two
+          // "Whole Milk"s, and the store then went to whichever came first.
+          if (client.targetList.getItemByName(product.name)) {
+            const outcome = await client.addItem(product.name, quantity || 1, notes || null, "other", params.store_name || null);
+            return textResponse(`${addedText(product.name, client.targetList.name, outcome, quantity)} (barcode ${upc} is that product; the item already on the list was used)`);
           }
           await client.addProduct(product, quantity || 1, notes || null);
           if (params.store_name) await client.setItemStore(product.name, params.store_name);
@@ -303,9 +327,9 @@ export function register(server, getClient) {
           const { valid, message } = await validateStoreName(client, params.store_name);
           if (!valid) return errorResponse(message);
           const resolved = await resolveItemName(client, itemName);
-          await client.setItemStore(resolved, params.store_name || null);
-          return textResponse(params.store_name
-            ? `Assigned "${resolved}" to store "${params.store_name}"`
+          const store = await client.setItemStore(resolved, params.store_name || null);
+          return textResponse(store
+            ? `Assigned "${resolved}" to store "${store}"`
             : `Cleared the store for "${resolved}"`);
         }
         case "check_item": {
@@ -313,8 +337,10 @@ export function register(server, getClient) {
           if (!itemName) itemName = await elicitRequiredField("name", "What item would you like to check off?");
           await client.connect(list_name);
           const resolvedCheck = await resolveItemName(client, itemName);
-          await client.removeItem(resolvedCheck);
-          return textResponse(`Successfully checked off "${resolvedCheck}" from list "${client.targetList.name}"`);
+          const changed = await client.removeItem(resolvedCheck);
+          return textResponse(changed
+            ? `Successfully checked off "${resolvedCheck}" from list "${client.targetList.name}"`
+            : `"${resolvedCheck}" was already checked off on list "${client.targetList.name}"`);
         }
         case "uncheck_item": {
           let itemName = name;

@@ -56,7 +56,35 @@ test('re-adding a checked-off item fails when its save fails', async () => {
 test('re-adding an item already on the list fails when its save fails', async () => {
   const c = oneItem({ name: 'Milk', checked: false, save: failingSave });
   await c.connect('Groceries');
-  await assert.rejects(c.addItem('Milk'), /Failed to add item "Milk": save refused/);
+  await assert.rejects(c.addItem('Milk', 2), /Failed to add item "Milk": save refused/);
+});
+
+test('addItem says what happened, and writes nothing for a plain re-add of a listed item', async () => {
+  let saves = 0;
+  const save = async () => { saves++; };
+  const c = connected(library(() => [{ name: 'Groceries', stores: [], items: [
+    { name: 'Milk', checked: false, save }, { name: 'Eggs', checked: true, save },
+  ] }]));
+  c.client.createItem = o => o;
+  await c.connect('Groceries');
+  c.targetList.addItem = async () => {};
+  assert.equal(await c.addItem('Milk'), 'already');
+  assert.equal(saves, 0);
+  assert.equal(await c.addItem('Eggs'), 'rechecked');
+  assert.equal(saves, 1);
+  assert.equal(await c.addItem('Butter'), 'added');
+});
+
+test('connect logs in without the websocket', async () => {
+  const seen = [];
+  const c = new AnyListClient({ username: 'u', password: 'p' });
+  c._createLibraryClient = () => {
+    const lib = library(() => [{ name: 'Groceries', items: [], stores: [] }]);
+    lib.login = async (...args) => { seen.push(args); };
+    return lib;
+  };
+  await c.connect('Groceries');
+  assert.deepEqual(seen, [[false]]);
 });
 
 test('setItemStore matches a store name regardless of case and apostrophe', async () => {
@@ -67,8 +95,20 @@ test('setItemStore matches a store name regardless of case and apostrophe', asyn
     stores: [{ name: 'Trader Joe’s', identifier: 'tj' }, { name: 'H.E.B.', identifier: 'heb' }],
   }]));
   await c.connect('Groceries');
-  await c.setItemStore('Dumplings', "trader joe's");
+  assert.equal(await c.setItemStore('Dumplings', "trader joe's"), 'Trader Joe’s');
   assert.deepEqual(set, ['tj']);
+});
+
+test('removeItem says whether it checked anything off, and saves only when it did', async () => {
+  let saves = 0;
+  const save = async () => { saves++; };
+  const c = connected(library(() => [{ name: 'Groceries', stores: [], items: [
+    { name: 'Milk', checked: false, save }, { name: 'Eggs', checked: true, save },
+  ] }]));
+  await c.connect('Groceries');
+  assert.equal(await c.removeItem('Milk'), true);
+  assert.equal(await c.removeItem('Eggs'), false);
+  assert.equal(saves, 1);
 });
 
 test('storeNameKey folds case, surrounding space and curly apostrophes, and nothing else', () => {

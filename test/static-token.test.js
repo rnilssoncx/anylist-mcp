@@ -108,3 +108,39 @@ describe('ANYLIST_STATIC_TOKEN at startup', () => {
     }
   });
 });
+
+describe('MCP sessions', () => {
+  it('end after the idle limit, renewed by each request, so an abandoned one is not held for the life of the process', async () => {
+    const e = serverEnv({ ANYLIST_STATIC_TOKEN: TOKEN, SEED_EMAIL: 'house@example.com', SEED_CLIENT_ID: 'c1', SEED_CLIENT_SECRET: 'a'.repeat(40), ANYLIST_USERNAME: 'u', ANYLIST_PASSWORD: 'p', ANYLIST_MCP_SESSION_IDLE_SECONDS: '2' });
+    assert.equal(spawnSync('node', ['scripts/seed.js'], { env: e, encoding: 'utf8' }).status, 0);
+    const child = spawn('node', ['src/http/index.js'], { env: e });
+    let out = '';
+    child.stdout.on('data', d => { out += d; });
+    child.stderr.on('data', d => { out += d; });
+    try {
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error(out)), 10000);
+        child.stdout.on('data', () => { if (out.includes('listening on port')) { clearTimeout(t); resolve(); } });
+      });
+      const post = (body, session) => fetch(`http://127.0.0.1:${e.PORT}/mcp`, { method: 'POST', body: JSON.stringify(body),
+        headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream',
+                   'mcp-protocol-version': '2025-06-18', ...(session ? { 'mcp-session-id': session } : {}) } });
+      const init = await post({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } } });
+      const session = init.headers.get('mcp-session-id');
+      assert.ok(session);
+      // A second session that initialises and is never used again.
+      const abandoned = (await post({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } } })).headers.get('mcp-session-id');
+      const list = (sid = session) => post({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, sid);
+      const wait = ms => new Promise(r => setTimeout(r, ms));
+      await wait(1200);
+      assert.equal((await list()).status, 200);
+      await wait(1400); // 2.6 s after initialize: alive only because the last request renewed it
+      assert.equal((await list()).status, 200);
+      await wait(2500);
+      assert.equal((await list()).status, 404);
+      assert.equal((await list(abandoned)).status, 404);
+    } finally {
+      child.kill();
+    }
+  });
+});

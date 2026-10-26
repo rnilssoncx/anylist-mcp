@@ -7,16 +7,15 @@ import { fileURLToPath } from "url";
 import path from "path";
 import { readFileSync } from "fs";
 import { randomBytes } from "crypto";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 
 import { getDb, loadAllowedEmails, deleteExpiredTokens } from "./db.js";
-import { getOrCreateSession } from "./session-manager.js";
+import { createMcpServer } from "./mcp-server.js";
 import oauthRouter, { requireBearerToken } from "./auth/oauth.js";
 import onboardingRouter from "./onboarding.js";
-import { registerAllTools, enabledTools } from "../tools/index.js";
+import { enabledTools } from "../tools/index.js";
 import { isGoogleEnabled } from "./auth/providers/google.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -162,12 +161,23 @@ app.use(onboardingRouter);
 // session, keyed by the Mcp-Session-Id header. This is required for elicitation
 // to work (the server needs to maintain request context across the session).
 
-const mcpSessions = new Map(); // sessionId → { server, transport }
+const mcpSessions = new Map(); // sessionId → { server, transport, idle }
 
-function createMcpServer(userId) {
-  const mcpServer = new McpServer({ name: "anylist-mcp-server", version: "1.9.0" });
-  registerAllTools(mcpServer, () => getOrCreateSession(userId));
-  return mcpServer;
+// A session ends when its client says so, and a connector that just stops
+// calling never does: each one held an McpServer and its transport for the life
+// of the process. So every session also ends after an idle spell, renewed by
+// each request. An hour is generous for a conversation and costs nothing to
+// exceed — a client whose session has gone gets a 404 and re-initialises.
+const MCP_SESSION_IDLE_MS =
+  (parseInt(process.env.ANYLIST_MCP_SESSION_IDLE_SECONDS, 10) || 3600) * 1000;
+
+function keepAlive(sessionId, entry) {
+  clearTimeout(entry.idle);
+  entry.idle = setTimeout(() => {
+    mcpSessions.delete(sessionId);
+    Promise.resolve(entry.server.close()).catch(err => console.error("Closing idle MCP session:", err));
+  }, MCP_SESSION_IDLE_MS);
+  entry.idle.unref();
 }
 
 // MCP endpoint — available at both / and /mcp.
@@ -193,13 +203,18 @@ async function handleMcp(req, res) {
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomBytes(16).toString("hex"),
         onsessioninitialized: (sid) => {
-          mcpSessions.set(sid, { server: mcpServer, transport });
+          const entry = { server: mcpServer, transport, idle: null };
+          mcpSessions.set(sid, entry);
+          keepAlive(sid, entry);
         },
       });
 
       transport.onclose = () => {
         const sid = transport.sessionId;
-        if (sid) mcpSessions.delete(sid);
+        if (sid) {
+          clearTimeout(mcpSessions.get(sid)?.idle);
+          mcpSessions.delete(sid);
+        }
       };
 
       await mcpServer.connect(transport);
@@ -207,6 +222,7 @@ async function handleMcp(req, res) {
       return;
     }
 
+    keepAlive(sessionId, mcpSession);
     await mcpSession.transport.handleRequest(req, res, req.body);
   } catch (err) {
     console.error("MCP request error:", err);
@@ -227,8 +243,10 @@ function makeSseConnectHandler(postEndpoint) {
       const transport = new SSEServerTransport(postEndpoint, res);
       const sessionId = transport.sessionId;
       const mcpServer = createMcpServer(req.userId);
-      mcpSessions.set(sessionId, { server: mcpServer, transport });
-      transport.onclose = () => { mcpSessions.delete(sessionId); };
+      const entry = { server: mcpServer, transport, idle: null };
+      mcpSessions.set(sessionId, entry);
+      keepAlive(sessionId, entry);
+      transport.onclose = () => { clearTimeout(entry.idle); mcpSessions.delete(sessionId); };
       await mcpServer.connect(transport); // connect() calls transport.start() internally
     } catch (err) {
       console.error("SSE connect error:", err);
@@ -243,6 +261,7 @@ async function handleSseMessage(req, res) {
     if (!mcpSession || !(mcpSession.transport instanceof SSEServerTransport)) {
       return res.status(404).json({ error: "SSE session not found." });
     }
+    keepAlive(req.query.sessionId, mcpSession);
     await mcpSession.transport.handlePostMessage(req, res, req.body);
   } catch (err) {
     console.error("SSE message error:", err);

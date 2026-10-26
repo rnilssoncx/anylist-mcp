@@ -42,7 +42,14 @@ export function enabledTools(setting = process.env.ANYLIST_TOOLS) {
  *   For stdio: always returns the same singleton client.
  *   For HTTP: returns the per-user client from the session manager.
  * @param {string[]} [names] Tools to register; defaults to `enabledTools()`.
+ * @param {(run: () => Promise<any>) => Promise<any>} [serialise] Wraps every
+ *   tool call; the HTTP server passes a per-user queue (see http/mcp-server.js).
  */
-export function registerAllTools(server, getClient, names = enabledTools()) {
-  for (const name of names) TOOLS[name](server, getClient);
+export function registerAllTools(server, getClient, names = enabledTools(), serialise = run => run()) {
+  // The tools still see the real server (elicitation reads `server.server`);
+  // only registerTool is intercepted, so every handler runs inside `serialise`.
+  const wrapped = Object.create(server);
+  wrapped.registerTool = (name, config, handler) =>
+    server.registerTool(name, config, (...args) => serialise(() => handler(...args)));
+  for (const name of names) TOOLS[name](wrapped, getClient);
 }

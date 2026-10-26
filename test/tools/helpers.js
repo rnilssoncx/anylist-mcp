@@ -90,14 +90,19 @@ export class MockAnyListClient {
     this._items.push({ name: product.name, quantity: qty, notes, productUpc: product.productUpc, photoIds: product.photoIds });
   }
 
+  // Records every call as a pushed item, as before; `_addOutcome` sets what
+  // AnyListClient.addItem would report ("added", "rechecked" or "already").
   async addItem(name, qty, notes, category, store = null) {
     this._items.push({ name, quantity: qty, notes, category, store });
+    return this._addOutcome || 'added';
   }
 
   async removeItem(name) {
     const idx = this._items.findIndex(i => i.name === name);
     if (idx === -1) throw new Error(`Item "${name}" not found in list, so can't check it`);
+    if (this._items[idx].checked) return false;
     this._items[idx].checked = true;
+    return true;
   }
 
   async uncheckItem(name) {
@@ -128,7 +133,10 @@ export class MockAnyListClient {
   async setItemStore(name, store) {
     const item = this._items.find(i => i.name === name);
     if (!item) throw new Error(`Item "${name}" not found in list`);
-    item.store = store || null;
+    // The real client returns AnyList's spelling; the mock's stores carry it.
+    const canonical = store ? ((this._stores || []).find(s => s.name.toLowerCase() === store.toLowerCase())?.name ?? store) : null;
+    item.store = canonical;
+    return canonical;
   }
 
   async getFavoriteItems() { return this._favorites; }

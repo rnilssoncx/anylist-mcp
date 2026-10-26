@@ -35,14 +35,15 @@ class AnyListClient {
     try {
       // Create AnyList client if not already authenticated
       if (!this.client) {
-        this.client = new AnyList({
-          email: username,
-          password: password
-        });
+        this.client = this._createLibraryClient({ email: username, password });
 
-        // Authenticate
+        // Authenticate. No websocket: connect() re-reads the lists on every
+        // call, so its refresh has no reader, and its error handler is an async
+        // listener whose token refresh throws when AnyList or the network is
+        // down — an unhandled rejection that ended the process, and with it
+        // every server in the container.
         console.error(`Connecting to AnyList as ${username}...`);
-        await this.client.login();
+        await this.client.login(false);
         console.error('Successfully authenticated with AnyList');
       }
 
@@ -73,6 +74,11 @@ class AnyListClient {
       console.error(wrappedError.message);
       throw wrappedError;
     }
+  }
+
+  /** The anylist-js client; a seam so tests can see how it is driven. */
+  _createLibraryClient(options) {
+    return new AnyList(options);
   }
 
   /**
@@ -126,6 +132,10 @@ class AnyListClient {
   // op (see Item.assignToCustomCategory), which is unsafe until Item._encode
   // round-trips recipeId / rawIngredient / prices / photoIds. Workaround for
   // callers: delete the item and re-add it with the new quantity.
+  //
+  // Returns what happened — "added", "rechecked" (it was checked off) or
+  // "already" (it was on the list) — so the tool can say which, and say when a
+  // quantity it was given did not reach the apps.
   async addItem(itemName, quantity = 1, notes = null, category = "other", store = null) {
     if (!this.targetList) {
       const error = new Error('Not connected to any list. Call connect() first.');
@@ -133,6 +143,7 @@ class AnyListClient {
       throw error;
     }
 
+    let outcome = "added";
     try {
       // First, check if item already exists
       const existingItem = this.targetList.getItemByName(itemName);
@@ -150,20 +161,21 @@ class AnyListClient {
 
           console.error(`Unchecked existing item: ${existingItem.name}`);
           await existingItem.save();
+          outcome = "rechecked";
         } else {
-
-          // Item already exists and is unchecked, no action needed
           console.error(`Item "${itemName}" already exists and is active`);
-          existingItem.quantity = quantity;
-          if (notes !== null) {
-            existingItem.details = notes;
+          // Nothing to write unless a note or a non-default quantity was given.
+          if (notes !== null || String(quantity) !== "1") {
+            existingItem.quantity = quantity;
+            if (notes !== null) {
+              existingItem.details = notes;
+            }
+            // Awaited: unawaited, a failed save is reported as success, and the
+            // rejection, unhandled, ends the Node process — which start.sh
+            // answers by stopping the whole container.
+            await existingItem.save();
           }
-          // Category not used if item already has a category
-
-          // Awaited: unawaited, a failed save is reported as success, and the
-          // rejection, unhandled, ends the Node process — which start.sh answers
-          // by stopping the whole container.
-          await existingItem.save();
+          outcome = "already";
         }
       } else {
         // Item doesn't exist, create new one
@@ -190,6 +202,7 @@ class AnyListClient {
       if (store) {
         await this.setItemStore(itemName, store);
       }
+      return outcome;
 
     } catch (error) {
       const wrappedError = new Error(`Failed to add item "${itemName}": ${error.message}`);
@@ -241,14 +254,16 @@ class AnyListClient {
         throw error;
       }
 
-      // Check the item (mark as completed) instead of deleting
+      // Check the item (mark as completed) instead of deleting. Says whether it
+      // changed, so the tool does not report checking off what already was.
       if (!existingItem.checked) {
         existingItem.checked = true;
         await existingItem.save();
         console.error(`Checked off item: ${existingItem.name}`);
-      } else {
-        console.error(`Item "${itemName}" is already checked off`);
+        return true;
       }
+      console.error(`Item "${itemName}" is already checked off`);
+      return false;
     } catch (error) {
       const wrappedError = new Error(`Failed to remove item "${itemName}": ${error.message}`);
       console.error(wrappedError.message);
@@ -366,8 +381,9 @@ class AnyListClient {
       throw new Error(`Item "${itemName}" not found in list`);
     }
     let storeIds = [];
+    let store = null;
     if (storeName) {
-      const store = (this.targetList.stores || []).find(s => storeNameKey(s.name) === storeNameKey(storeName));
+      store = (this.targetList.stores || []).find(s => storeNameKey(s.name) === storeNameKey(storeName));
       if (!store) {
         const available = (this.targetList.stores || []).map(s => s.name).join(', ') || 'none';
         throw new Error(`Store "${storeName}" not found. Available stores: ${available}`);
@@ -375,6 +391,8 @@ class AnyListClient {
       storeIds = [store.identifier];
     }
     await item.setStores(storeIds);
+    // AnyList's spelling of the store, not the caller's, for anything reported back.
+    return store ? store.name : null;
   }
 
   async createStore(storeName) {
