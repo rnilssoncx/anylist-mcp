@@ -55,6 +55,13 @@ function list(items) {
   return { any, l, posts };
 }
 
+test("assignment ids are AnyList's: uuid5 of the set id", () => {
+  // Computed independently with Python's uuid.uuid5 against the namespace the
+  // household's own items' ids were checked against.
+  assert.equal(Item.assignmentId('abc'), '1dbf254d2458551891eaae2d7e385e15');
+  assert.notEqual(Item.assignmentId('abd'), Item.assignmentId('abc'));
+});
+
 test('assignCategory sends the assignment, then the match id in originalValue, as partial items', async () => {
   const { l, posts } = list([{
     identifier: 'i-1', listId: 'list-1', name: 'Smoked Paprika', categoryMatchId: 'other',
@@ -70,9 +77,10 @@ test('assignCategory sends the assignment, then the match id in originalValue, a
   const [assign, match] = posts[0].ops;
   assert.equal(assign.metadata.handlerId, 'update-list-item-category-assignment');
   assert.equal(assign.listItemId, 'i-1');
-  // The group's assignment is replaced in place; another group's is kept.
+  // The group's assignment is replaced, under the id the app gives it — not
+  // the random one it had; another group's is kept as it was.
   assert.deepEqual(assign.listItem.categoryAssignments.map(a => [a.identifier, a.categoryGroupId, a.categoryId]),
-    [['a-2', 'g-store', 'c-aisle-9'], ['a-1', GROUP, 'c-penzys']]);
+    [['a-2', 'g-store', 'c-aisle-9'], [Item.assignmentId(GROUP), GROUP, 'c-penzys']]);
   assert.equal(assign.listItem.name, null);
 
   assert.equal(match.metadata.handlerId, 'set-list-item-category-match-id');
@@ -91,7 +99,7 @@ test('a new item created with categoryFields is sent filed in that category', as
   assert.equal(sent.categoryMatchId, 'dairy');
   assert.equal(sent.category, 'dairy');
   assert.deepEqual(sent.categoryAssignments.map(a => [a.categoryGroupId, a.categoryId]), [[GROUP, 'c-dairy']]);
-  assert.match(sent.categoryAssignments[0].identifier, /^[0-9a-f]{32}$/);
+  assert.equal(sent.categoryAssignments[0].identifier, Item.assignmentId(GROUP));
 });
 
 // AnyListClient over a hand-made list with one category group.
