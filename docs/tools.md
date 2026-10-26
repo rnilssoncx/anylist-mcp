@@ -20,51 +20,65 @@ Tests the connection to AnyList and verifies access to the target list.
 
 ## `shopping`
 
-Manage shopping lists and items.
+Manage shopping lists, items, stores and categories.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `action` | enum | Yes | See actions below |
 | `list_name` | string | No | Target list (defaults to configured default) |
-| `name` | string | For item actions | Item name |
-| `quantity` | number | No | Item quantity (add_item only, default 1) |
-| `notes` | string | No | Item notes (add_item only) |
-| `include_checked` | boolean | No | Include checked-off items (list_items only) |
-| `include_notes` | boolean | No | Include item notes in output (list_items only) |
-| `store_name` | string | No | Filter items by store (add_items, set_item_category only) |
-| `category` | string | No | Category for item (add_item only) |
+| `name` | string | For item actions | Item name; partial names are matched |
+| `new_name` | string | No | New item name (update_item) |
+| `quantity` | number or string | No | e.g. `2` or `"500 g"` (add_item, update_item) |
+| `notes` | string | No | Item notes (add_item, update_item; `""` clears on update_item) |
+| `exact` | boolean | No | Add the name as given, without matching saved items (add_item) |
+| `items` | array | For add_items | Names, or objects with name/quantity/notes/category/store_name/exact |
+| `category` | string | No | A category on the list, by name: built-in or the household's own (add_item, add_items, set_item_category) |
+| `store_name` | string | No | add_item: a store added to the item's stores. set_item_store: the only store. create_store / rename_store / delete_store: the store |
+| `store_names` | string[] | No | Every store for the item (set_item_store; `[]` clears) |
+| `new_store_name` | string | No | The store's new name (rename_store) |
+| `upc` | string | For barcode actions | Barcode digits (lookup_upc, add_by_upc) |
+| `include_checked` | boolean | No | Include checked-off items (list_items) |
+| `include_notes` | boolean | No | Include item notes in output (list_items) |
 
 **Actions:**
 
 ```json
-// List all shopping lists with item counts
+// Lists, and the items on one (grouped by category, with every store an item is at)
 { "name": "shopping", "arguments": { "action": "list_lists" } }
-
-// List items on a list, grouped by category
 { "name": "shopping", "arguments": { "action": "list_items", "list_name": "Costco", "include_notes": true } }
 
-// Add an item
-{ "name": "shopping", "arguments": { "action": "add_item", "name": "Eggs", "quantity": 2, "notes": "organic", "store": "Costco"} }
+// Add items; a name is matched against items already saved on the list
+{ "name": "shopping", "arguments": { "action": "add_item", "name": "Eggs", "quantity": 2, "notes": "organic", "store_name": "Costco", "category": "Dairy" } }
+{ "name": "shopping", "arguments": { "action": "add_items", "items": ["Milk", { "name": "Paprika", "category": "Penzy's" }] } }
 
-// Check off an item (supports partial name matching)
+// Change an item already on the list: name, quantity or notes
+{ "name": "shopping", "arguments": { "action": "update_item", "name": "Eggs", "new_name": "Eggs, large", "quantity": "2 dozen" } }
+
+// Check off, uncheck, delete
 { "name": "shopping", "arguments": { "action": "check_item", "name": "Eggs" } }
-
-// Uncheck a checked-off item (supports partial matching against checked items)
 { "name": "shopping", "arguments": { "action": "uncheck_item", "name": "Eggs" } }
-
-// Delete an item permanently
 { "name": "shopping", "arguments": { "action": "delete_item", "name": "Eggs" } }
 
-// Get favorite items for a list
+// Favorites and recents
 { "name": "shopping", "arguments": { "action": "get_favorites" } }
-
-// Get recently added items for a list
 { "name": "shopping", "arguments": { "action": "get_recents" } }
 
-// Set store for an item
-{ "name": "shopping", "arguments": { "action": "set_item_store", "name": "Milk", "store_name": "Costco" } }
+// Categories
+{ "name": "shopping", "arguments": { "action": "list_categories" } }
+{ "name": "shopping", "arguments": { "action": "set_item_category", "name": "Sosiski", "category": "Meat" } }
 
-// Set category for an item
+// An item's stores (this replaces them; the reply names any removed)
+{ "name": "shopping", "arguments": { "action": "set_item_store", "name": "Milk", "store_names": ["Costco", "Kroger"] } }
+
+// Stores on the list
+{ "name": "shopping", "arguments": { "action": "list_stores" } }
+{ "name": "shopping", "arguments": { "action": "create_store", "store_name": "Costco" } }
+{ "name": "shopping", "arguments": { "action": "rename_store", "store_name": "Costco", "new_store_name": "Costco Wholesale" } }
+{ "name": "shopping", "arguments": { "action": "delete_store", "store_name": "Costco Wholesale" } }
+
+// Barcodes
+{ "name": "shopping", "arguments": { "action": "lookup_upc", "upc": "0074338007611" } }
+{ "name": "shopping", "arguments": { "action": "add_by_upc", "upc": "0074338007611", "store_name": "Kroger" } }
 ```
 
 ---

@@ -34,23 +34,27 @@ describe('shopping tool', () => {
     });
 
 
-    it ('should default to "other" category if not provided', async () => {
+    it('leaves the category to AnyList when none is given', async () => {
       await handlers.shopping({ action: 'add_item', name: 'Bread' });
-      assert.equal(client._items[0].category, 'other');
+      assert.equal(client._items[0].category, null);
     });
 
-    it('should set category when provided', async () => {
+    it('passes a category the list has to the client', async () => {
       await handlers.shopping({ action: 'add_item', name: 'Bananas', category: 'produce' });
       assert.equal(client._items[0].category, 'produce');
     });
 
-    it('should return error for invalid category', async () => {
-      try {
-        await handlers.shopping({ action: 'add_item', name: 'Soda', category: 'invalid-category' });
-        assert.fail('Expected error for invalid category');
-      } catch (e) {
-        assert.ok(e.message.includes('Invalid input for field "category"'));
-      }
+    it("accepts the household's own category", async () => {
+      const result = await handlers.shopping({ action: 'add_item', name: 'Smoked Paprika', category: 'Penzy’s', exact: true });
+      assert.equal(result.isError, undefined);
+      assert.equal(client._items[0].category, 'Penzy’s');
+    });
+
+    it('refuses a category the list does not have, naming the ones it does, and adds nothing', async () => {
+      const result = await handlers.shopping({ action: 'add_item', name: 'Soda', category: 'invalid-category' });
+      assert.equal(result.isError, true);
+      assert.equal(result.content[0].text, 'Category "invalid-category" not found in list "Test List". Available categories: Produce, Dairy, Other, Penzy’s');
+      assert.deepEqual(client._items, []);
     });
   });
 
@@ -210,10 +214,10 @@ describe('shopping tool', () => {
       assert.equal(client._items[0].category, 'dairy');
     });
 
-    it('defaults quantity to 1 and category to other', async () => {
+    it('defaults quantity to 1 and leaves the category to AnyList', async () => {
       await handlers.shopping({ action: 'add_items', items: ['Milk'] });
       assert.equal(client._items[0].quantity, 1);
-      assert.equal(client._items[0].category, 'other');
+      assert.equal(client._items[0].category, null);
     });
 
     it('mixes plain names and objects', async () => {
@@ -243,7 +247,7 @@ describe('shopping tool', () => {
         items: [{ name: 'Soda', category: 'invalid-category' }, 'Milk'],
       });
       assert.equal(result.isError, true);
-      assert.ok(result.content[0].text.includes('invalid category "invalid-category"'));
+      assert.ok(result.content[0].text.includes('✗ Soda: Category "invalid-category" not found in list "Test List".'));
       assert.deepEqual(client._items.map(i => i.name), ['Milk']);
     });
 

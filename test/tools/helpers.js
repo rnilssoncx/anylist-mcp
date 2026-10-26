@@ -24,6 +24,15 @@ export function createMockServer() {
   return { server, handlers };
 }
 
+function defaultCategories() {
+  return [
+    { identifier: 'c-produce', name: 'Produce', systemCategory: 'produce' },
+    { identifier: 'c-dairy', name: 'Dairy', systemCategory: 'dairy' },
+    { identifier: 'c-other', name: 'Other', systemCategory: 'other' },
+    { identifier: 'c-penzys', name: 'Penzy’s' },
+  ];
+}
+
 export class MockAnyListClient {
   constructor() {
     this.client = null;
@@ -40,6 +49,7 @@ export class MockAnyListClient {
     this._collections = [];
     this._pendingImport = null;
     this._stores = [];
+    this._categories = defaultCategories();
   }
 
   reset() {
@@ -56,6 +66,7 @@ export class MockAnyListClient {
     this._collections = [];
     this._pendingImport = null;
     this._stores = [];
+    this._categories = defaultCategories();
   }
 
   async connect(listName = null) {
@@ -74,6 +85,24 @@ export class MockAnyListClient {
 
   getLists() { return this._lists; }
   getStores() { return this._stores || []; }
+
+  // Matching is AnyListClient.findCategory's job, tested in item-categories;
+  // the mock matches a name or a system id, case aside.
+  getCategories() { return this._categories; }
+  findCategory(name) {
+    const key = String(name).toLowerCase();
+    return this._categories.find(c => c.name.toLowerCase() === key || c.systemCategory === key) || null;
+  }
+  categoryNotFound(name) {
+    return `Category "${name}" not found in list "${this.targetList.name}". Available categories: ${this._categories.map(c => c.name).join(', ')}`;
+  }
+  async setItemCategory(name, category) {
+    const item = this._items.find(i => i.name === name);
+    if (!item) throw new Error(`Item "${name}" not found in list`);
+    const from = item.category || 'Other';
+    item.category = this.findCategory(category).name;
+    return { from, to: item.category };
+  }
 
   // Barcode lookup: `_products` maps a UPC to what AnyList would return.
   // `_lookupError` makes the lookup fail, as a network or server error would.

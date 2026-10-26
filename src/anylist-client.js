@@ -1,4 +1,5 @@
 import AnyList from '../anylist-js/lib/index.js';
+import Item from '../anylist-js/lib/item.js';
 import { normalizeRecipe } from './recipe-normalizer.js';
 
 class AnyListClient {
@@ -102,7 +103,12 @@ class AnyListClient {
   async addProduct(product, quantity = 1, notes = null) {
     if (!this.targetList) throw new Error('Not connected to any list. Call connect() first.');
     const options = { name: product.name, productUpc: product.productUpc, photoIds: product.photoIds || [] };
-    if (product.categoryMatchId) options.categoryMatchId = product.categoryMatchId;
+    // The lookup gives a category id, not a category; filed under the list's
+    // category with that id, as one added in the app would be.
+    if (product.categoryMatchId) {
+      const category = this.findCategory(product.categoryMatchId);
+      Object.assign(options, category ? Item.categoryFields(category) : { categoryMatchId: product.categoryMatchId });
+    }
     if (notes !== null) options.details = notes;
     const rawQuantity = quantity == null ? "" : String(quantity).trim();
     if (rawQuantity !== "" && rawQuantity !== "1") options.quantity = rawQuantity;
@@ -124,14 +130,10 @@ class AnyListClient {
     }));
   }
 
-  // Known limitation: quantity only sticks for NEW items (set via _encode during
-  // creation, below). For an existing item we fall back to existingItem.save(),
-  // which emits a `set-list-item-quantity` op — that handler does NOT populate
-  // quantityPb.rawQuantity, so the AnyList apps render no quantity change even
-  // though this server reports success. Fixing it needs a full `update-list-item`
-  // op (see Item.assignToCustomCategory), which is unsafe until Item._encode
-  // round-trips recipeId / rawIngredient / prices / photoIds. Workaround for
-  // callers: delete the item and re-add it with the new quantity.
+  // A quantity on an item already listed goes through Item.setQuantity: the
+  // `quantity` setter and save() write only the legacy field, which the apps
+  // do not render. A category applies to a new item only — re-adding one is
+  // not a request to move it; set_item_category is.
   //
   // Returns what happened — "added", "rechecked" (it was checked off) or
   // "already" (it was on the list) — so the tool can say which.
@@ -139,7 +141,7 @@ class AnyListClient {
   // A store given here is added to the item's stores, never put in place of
   // them: a saved item is often bought at two or three, and re-adding it "from
   // Kroger" is not a request to forget the others.
-  async addItem(itemName, quantity = 1, notes = null, category = "other", store = null) {
+  async addItem(itemName, quantity = 1, notes = null, category = null, store = null) {
     if (!this.targetList) {
       const error = new Error('Not connected to any list. Call connect() first.');
       console.error(error.message);
@@ -187,8 +189,10 @@ class AnyListClient {
         if (notes !== null) {
           itemOptions.details = notes;
         }
-        if (category !== "other") {
-          itemOptions.categoryMatchId = category;
+        if (category) {
+          const found = this.findCategory(category);
+          if (!found) throw new Error(this.categoryNotFound(category));
+          Object.assign(itemOptions, Item.categoryFields(found));
         }
         // Carry the quantity through creation so it lands in quantityPb.rawQuantity
         // (List.addItem encodes the item). Bare "1" is AnyList's default, so skip it.
@@ -328,7 +332,7 @@ class AnyListClient {
           name: item.name,
           quantity: item.quantity ?? null,
           checked: item.checked || false,
-          category: item.categoryMatchId || 'other'
+          category: this.categoryNameOf(item)
         };
         if (includeNotes && item.details) {
           result.note = item.details;
@@ -481,6 +485,71 @@ class AnyListClient {
       activeItems: assigned.filter(i => !i.checked).map(i => i.name),
       savedCount: assigned.filter(i => i.checked).length,
     };
+  }
+
+  // ===== CATEGORIES =====
+
+  // Every category on the list, built-in and the household's own, in AnyList's
+  // order. A list with several category groups lists a name once.
+  getCategories() {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    const seen = new Set();
+    const categories = [];
+    for (const group of this.targetList.categoryGroups || []) {
+      for (const category of [...group.categories].sort((a, b) => a.sortIndex - b.sortIndex)) {
+        if (seen.has(category.name)) continue;
+        seen.add(category.name);
+        categories.push({ ...category, categoryGroupId: group.identifier });
+      }
+    }
+    return categories;
+  }
+
+  // A category by its name or its id, matched the way AnyList files items:
+  // "Condiments & Dressings", "condiments-oils-and-salad-dressings" and
+  // "penzy's" all find theirs. The first group wins when a list has several.
+  findCategory(nameOrId) {
+    const key = Item.categoryMatchId({ name: nameOrId });
+    if (!key) return null;
+    return this.getCategories().find(c => c.systemCategory === key || Item.categoryMatchId({ name: c.name }) === key) || null;
+  }
+
+  categoryNotFound(name) {
+    const available = this.getCategories().map(c => c.name).join(', ') || 'none';
+    return `Category "${name}" not found in list "${this.targetList.name}". Available categories: ${available}`;
+  }
+
+  // The name of the category an item shows under: its assignment if it has
+  // one, else the category its id files it in, as the apps resolve it.
+  categoryNameOf(item) {
+    const categories = this.getCategories();
+    for (const a of item.categoryAssignments || []) {
+      const assigned = categories.find(c => c.identifier === a.categoryId);
+      if (assigned) return assigned.name;
+    }
+    const matchId = item.categoryMatchId || 'other';
+    const filed = categories.find(c => Item.categoryMatchId(c) === matchId);
+    return filed ? filed.name : matchId;
+  }
+
+  // Returns the category the item was in and the one it is in now, by name.
+  async setItemCategory(itemName, categoryName) {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    const item = this.targetList.getItemByName(itemName);
+    if (!item) {
+      throw new Error(`Item "${itemName}" not found in list`);
+    }
+    const category = this.findCategory(categoryName);
+    if (!category) {
+      throw new Error(this.categoryNotFound(categoryName));
+    }
+    const from = this.categoryNameOf(item);
+    await item.assignCategory(category);
+    return { from, to: category.name };
   }
 
   // ===== RECIPES =====
