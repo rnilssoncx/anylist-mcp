@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { createHash, randomBytes, randomUUID } from "crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "crypto";
 import bcrypt from "bcrypt";
 import {
   getOAuthClient,
@@ -12,6 +12,7 @@ import {
   getTokenByRefresh,
   deleteTokensByRefresh,
   getAnyListCredentials,
+  getUserByEmail,
 } from "../db.js";
 import { loginWithPassword, registerWithPassword } from "./providers/password.js";
 import { loginWithGoogle, isGoogleEnabled } from "./providers/google.js";
@@ -434,6 +435,14 @@ export function requireBearerToken(req, res, next) {
     return res.status(401).json({ error: "unauthorized" });
   }
   const token = auth.slice(7);
+  // A fixed token, for clients that can send a header but cannot run an OAuth
+  // flow (Claude's custom connectors offer request headers, not client
+  // credentials). It acts as the seeded user; unset, this path does not exist.
+  const staticUser = staticTokenUser(token);
+  if (staticUser) {
+    req.userId = staticUser.id;
+    return next();
+  }
   const record = getTokenRecord(token);
   if (!record) {
     console.log(`[oauth] ANOMALOUS unknown bearer token ip=${req.ip}`);
@@ -447,6 +456,15 @@ export function requireBearerToken(req, res, next) {
   }
   req.userId = record.user_id;
   next();
+}
+
+/** The seeded user, if `token` is ANYLIST_STATIC_TOKEN; compared in constant time. */
+export function staticTokenUser(token) {
+  const expected = process.env.ANYLIST_STATIC_TOKEN;
+  if (!expected) return null;
+  const a = Buffer.from(token), b = Buffer.from(expected);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+  return getUserByEmail(process.env.SEED_EMAIL || "") || null;
 }
 
 export default router;

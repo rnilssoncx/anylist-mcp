@@ -39,6 +39,18 @@ function validateEnv() {
     console.warn("BASE_URL not set — will derive from incoming request Host header (fine for dev/tunnel use)");
   }
   loadAllowedEmails(); // Will throw + exit if file missing
+  // A fixed token is a password for the whole account: refuse a short one,
+  // and one with no seeded user to act as.
+  if (process.env.ANYLIST_STATIC_TOKEN !== undefined) {
+    if (process.env.ANYLIST_STATIC_TOKEN.length < 32) {
+      console.error("ANYLIST_STATIC_TOKEN must be at least 32 characters.");
+      process.exit(1);
+    }
+    if (!process.env.SEED_EMAIL) {
+      console.error("ANYLIST_STATIC_TOKEN needs SEED_EMAIL, the user it acts as.");
+      process.exit(1);
+    }
+  }
   // Tools are registered per session, so a bad ANYLIST_TOOLS would otherwise
   // pass startup and fail every session instead. Refuse it here.
   try {
