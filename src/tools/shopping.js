@@ -11,7 +11,9 @@ function buildDescription(stores) {
 - add_item: Add an item to a list. A name is matched against items already saved on the list (specific products, often scanned): one match is re-added, several are listed back without adding anything — ask which one, or resend with exact: true
 - add_items: Add several items to a list in one call (use this instead of repeating add_item); entries are matched the same way
 - update_item: Change an item already on the list — its name (new_name), quantity or notes. Its stores, barcode and photo are kept
-- set_item_category: Move an item already on the list into a category (category)
+- set_item_category: Move an item already on the list into a category (category). With store, the category is in that store's own category set — its view in the app — and the ordinary categories are left as they are
+- set_item_categories: File up to 25 items in a store's category set at once (store, and items as {name, category}) — e.g. Kroger aisles from the Kroger server's aisles tool. Names must be exactly as on the list; "Aisle <number>" is created when the set lacks it
+- list_items: include_barcodes adds each scanned item's barcode, for looking it up elsewhere
 - list_categories: List the list's categories — AnyList's built-in ones and the household's own
 - set_item_store: Set the stores for an item already on the list (store_names, or store_name for one); an empty list clears them. This replaces the item's stores — list_items shows the ones it has, and the reply names any removed
 - check_item: Check off (complete) an item
@@ -36,6 +38,35 @@ function buildDescription(stores) {
 function validateCategory(client, category) {
   if (!category || client.findCategory(category)) return { valid: true, message: null };
   return { valid: false, message: client.categoryNotFound(category) };
+}
+
+// § The words in plans/010; every string here is pinned by a test.
+function departmentsText(n, store) {
+  return n > 0 ? `Added ${n} department${n === 1 ? "" : "s"} to the ${store} set.` : null;
+}
+
+function ruleText(error) {
+  return error ? `, but AnyList's rule for it wasn't saved, so re-adding it from the app may file it where it was: ${error}` : "";
+}
+
+function rowText(o, store) {
+  switch (o.kind) {
+    case "assigned":
+      return `"${o.name}" → ${o.category.name}${o.created ? " (new category)" : ""}${ruleText(o.ruleError)}`;
+    case "not-on-list":
+      return `"${o.name}": not on the list`;
+    case "duplicate":
+      return `"${o.name}": not written — two items are called that`;
+    case "refused":
+      return `"${o.name}": ${o.asked} is not a category in the ${store} set, and only "Aisle <number>" is created automatically`;
+    case "not-created":
+      return `"${o.name}": not written — ${o.aisle} couldn't be created: ${o.error}`;
+    default:
+      // "Couldn't confirm", not "not written": a timeout or a 5xx can arrive
+      // after the server applied the assignment.
+      return `"${o.name}": couldn't confirm the move — ${o.error}. Check the ${store} view`
+        + (o.created ? `; ${o.category.name} was created for it` : "");
+  }
 }
 
 async function validateStoreName(client, storeName) {
@@ -147,7 +178,7 @@ export function register(server, getClient) {
     description: buildDescription([]),
     inputSchema: {
       action: z.enum(["list_lists", "list_items", "add_item", "add_items",
-        "update_item", "set_item_category", "list_categories", "set_item_store", "check_item", "uncheck_item", "delete_item", "get_favorites", "get_recents", "list_stores",
+        "update_item", "set_item_category", "set_item_categories", "list_categories", "set_item_store", "check_item", "uncheck_item", "delete_item", "get_favorites", "get_recents", "list_stores",
         "create_store", "rename_store", "delete_store", "lookup_upc", "add_by_upc"]).describe("The shopping action to perform"),
       upc: z.string().optional().describe("Barcode digits (lookup_upc and add_by_upc only)"),
       list_name: z.string().optional().describe("Name of the list (defaults to configured default list)"),
@@ -163,12 +194,14 @@ export function register(server, getClient) {
           store_name: z.string().optional(),
           exact: z.boolean().optional(),
         })
-      ])).optional().describe("Items to add (add_items only). Each entry is either a plain item name or an object with name/quantity/notes/category/store_name/exact"),
+      ])).optional().describe("Items to add (add_items), or to file (set_item_categories: objects with name and category). For add_items each entry is either a plain item name or an object with name/quantity/notes/category/store_name/exact"),
       exact: z.boolean().optional().describe("Add the name exactly as given, without matching saved items (add_item only). Use after the person has chosen, or said to add it as written"),
       quantity: z.union([z.number().min(1), z.string().min(1)]).optional().describe("Item quantity, e.g. 2 or \"500 g\" (add_item and update_item; add_item defaults to 1)"),
       notes: z.string().optional().describe("Notes for the item (add_item and update_item; an empty string clears them on update_item)"),
       include_checked: z.boolean().optional().describe("Include checked-off items (list_items only, default false)"),
       include_notes: z.boolean().optional().describe("Include notes for each item (list_items only, default false)"),
+      include_barcodes: z.boolean().optional().describe("Show each scanned item's barcode after its name (list_items only, default false)"),
+      store: z.string().optional().describe("The store whose own category set to use (set_item_categories; set_item_category to file the item in that store's view only)"),
       category: z.string().optional().describe("A category on the list, by name — built-in or the household's own; list_categories shows them (add_item, add_items entries, set_item_category). Omit to let AnyList file a new item"),
       store_name: z.string().optional().describe("A store for this item (add_item adds it to the item's stores; set_item_store sets it as the only one, or clears them if blank), or the store to create, rename or delete (create_store, rename_store, delete_store)"),
       store_names: z.array(z.string()).optional().describe("Every store for this item (set_item_store only; replaces store_name; an empty array clears them)"),
@@ -208,7 +241,7 @@ export function register(server, getClient) {
             lastStoreSignature = sig;
             registeredTool.update({ description: buildDescription(stores) });
           }
-          const items = await client.getItems(include_checked || false, include_notes || false);
+          const items = await client.getItems(include_checked || false, include_notes || false, params.include_barcodes || false);
           if (items.length === 0) {
             return textResponse(include_checked
               ? `List "${client.targetList.name}" is empty.`
@@ -227,7 +260,8 @@ export function register(server, getClient) {
               const status = item.checked ? " ✓" : "";
               const note = item.note ? ` [${item.note}]` : "";
               const store = item.store ? ` @${item.store}` : "";
-              return `  - ${item.name}${qty}${status}${note}${store}`;
+              const barcode = item.barcode ? ` [barcode ${item.barcode}]` : "";
+              return `  - ${item.name}${barcode}${qty}${status}${note}${store}`;
             }).join("\n");
             return `**${category}**\n${categoryItems}`;
           }).join("\n\n");
@@ -354,13 +388,40 @@ export function register(server, getClient) {
           let categoryName = params.category;
           if (!categoryName) categoryName = await elicitRequiredField("category", `Which category should "${itemName}" go in?`);
           await client.connect(list_name);
-          const { valid, message } = validateCategory(client, categoryName);
-          if (!valid) return errorResponse(message);
+          // With a store, the store's set validates — the main set's check
+          // would refuse an aisle before the store's set was ever consulted.
+          if (!params.store) {
+            const { valid, message } = validateCategory(client, categoryName);
+            if (!valid) return errorResponse(message);
+          }
           const resolved = await resolveItemName(client, itemName);
-          const { from, to } = await client.setItemCategory(resolved, categoryName);
-          return textResponse(from === to
-            ? `"${resolved}" is filed under "${to}"`
-            : `Moved "${resolved}" from "${from}" to "${to}"`);
+          const result = await client.setItemCategory(resolved, categoryName, { store: params.store || null });
+          const { from, to, ruleError, departmentsAdded, store } = result;
+          // "in the Kroger view": without it, a member who asked to move
+          // something hears "Moved" and finds the ordinary list unchanged.
+          const where = store ? ` in the ${store} view` : "";
+          let line;
+          if (result.kind === "not-created") line = `"${resolved}": not written — ${result.aisle} couldn't be created: ${result.error}`;
+          // "Couldn't confirm", as in the batch: the request may have been
+          // applied before it failed.
+          else if (result.kind === "failed") line = `"${resolved}": couldn't confirm the move — ${result.error}. Check the ${store ? `${store} view` : "list"}`;
+          else line = (from === to
+            ? `"${resolved}" is filed under "${to}"${where}`
+            : `Moved "${resolved}" from "${from}" to "${to}"${where}`) + ruleText(ruleError);
+          const text = [departmentsText(departmentsAdded, store), line].filter(Boolean).join("\n");
+          return result.kind === "moved" ? textResponse(text) : errorResponse(text);
+        }
+        case "set_item_categories": {
+          const rows = params.items || [];
+          if (!params.store) return errorResponse(`set_item_categories needs a store`);
+          if (rows.length === 0) return errorResponse(`set_item_categories needs items: {name, category}`);
+          if (rows.some(r => typeof r === "string" || !r.category)) return errorResponse(`Every entry needs a name and a category`);
+          await client.connect(list_name);
+          const { departmentsAdded, outcomes, store } = await client.setItemCategories(params.store, rows.map(r => ({ name: r.name, category: r.category })));
+          const lines = outcomes.map(o => rowText(o, store));
+          const assigned = outcomes.filter(o => o.kind === "assigned").length;
+          return textResponse([departmentsText(departmentsAdded, store), ...lines, `Assigned ${assigned} of ${outcomes.length}.`]
+            .filter(Boolean).join("\n"));
         }
         case "list_categories": {
           await client.connect(list_name || null);

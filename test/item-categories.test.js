@@ -22,7 +22,8 @@ const AnyList = require('../anylist-js/lib/index.js');
 const List = require('../anylist-js/lib/list.js');
 const Item = require('../anylist-js/lib/item.js');
 
-const GROUP = 'g-1';
+// The main set's id is AnyList's uuid5 of the list id (Python's uuid.uuid5).
+const GROUP = 'b907355ef26d5331849d1d5fe1f23a61';
 const CATEGORIES = [
   { identifier: 'c-dairy', name: 'Dairy', systemCategory: 'dairy', sortIndex: 1 },
   { identifier: 'c-cond', name: 'Condiments & Dressings', systemCategory: 'condiments-oils-and-salad-dressings', sortIndex: 0 },
@@ -62,7 +63,7 @@ test("assignment ids are AnyList's: uuid5 of the set id", () => {
   assert.notEqual(Item.assignmentId('abd'), Item.assignmentId('abc'));
 });
 
-test('assignCategory sends the assignment, then the match id in originalValue, as partial items', async () => {
+test("assignCategory sends only its own set's assignment, then the match id in originalValue, as partial items", async () => {
   const { l, posts } = list([{
     identifier: 'i-1', listId: 'list-1', name: 'Smoked Paprika', categoryMatchId: 'other',
     categoryAssignments: [
@@ -77,10 +78,12 @@ test('assignCategory sends the assignment, then the match id in originalValue, a
   const [assign, match] = posts[0].ops;
   assert.equal(assign.metadata.handlerId, 'update-list-item-category-assignment');
   assert.equal(assign.listItemId, 'i-1');
-  // The group's assignment is replaced, under the id the app gives it — not
-  // the random one it had; another group's is kept as it was.
+  // Only the group's own assignment, under the id the app gives it — not the
+  // random one it had. The other group's is not re-sent: the server keeps
+  // what it is not sent, and re-sending a stale copy would revert it.
   assert.deepEqual(assign.listItem.categoryAssignments.map(a => [a.identifier, a.categoryGroupId, a.categoryId]),
-    [['a-2', 'g-store', 'c-aisle-9'], [Item.assignmentId(GROUP), GROUP, 'c-penzys']]);
+    [[Item.assignmentId(GROUP), GROUP, 'c-penzys']]);
+  assert.deepEqual(l.items[0].categoryAssignments.map(a => a.categoryGroupId), ['g-store', GROUP]);
   assert.equal(assign.listItem.name, null);
 
   assert.equal(match.metadata.handlerId, 'set-list-item-category-match-id');
@@ -108,7 +111,7 @@ function connected(items = []) {
   const c = new AnyListClient({ username: 'u', password: 'p' });
   c.client = { createItem: o => { created.push(o); return { ...o, storeIds: [] }; } };
   c.targetList = {
-    name: 'Groceries', items, stores: [],
+    identifier: 'list-1', name: 'Groceries', items, stores: [],
     categoryGroups: [{ identifier: GROUP, categories: CATEGORIES }],
     getItemByName: n => items.find(i => i.name === n),
     addItem: async i => { items.push(i); },
@@ -139,7 +142,8 @@ test('an item shows under its assignment first, else the category its id files i
   assert.equal(c.categoryNameOf({ categoryMatchId: 'dairy', categoryAssignments: [{ categoryGroupId: GROUP, categoryId: 'c-penzys' }] }), 'Penzy’s');
   assert.equal(c.categoryNameOf({ categoryMatchId: 'dairy', categoryAssignments: [] }), 'Dairy');
   assert.equal(c.categoryNameOf({ categoryMatchId: 'asian-market' }), 'Asian Market');
-  assert.equal(c.categoryNameOf({ categoryMatchId: 'deli' }), 'deli');
+  // An id the list has no category for shows under Other, as the app draws it.
+  assert.equal(c.categoryNameOf({ categoryMatchId: 'deli' }), 'Other');
 });
 
 test('addItem files a new item in the category it names', async () => {
@@ -176,7 +180,8 @@ test('setItemCategory moves the item and says where from and to', async () => {
   const sent = [];
   const item = { name: 'Sosiski', categoryMatchId: 'dairy', categoryAssignments: [], assignCategory: async cat => { sent.push(cat); } };
   const { c } = connected([item]);
-  assert.deepEqual(await c.setItemCategory('Sosiski', 'other'), { from: 'Dairy', to: 'Other' });
+  c.targetList.saveCategorizationRule = async () => {};
+  assert.deepEqual(await c.setItemCategory('Sosiski', 'other'), { kind: 'moved', from: 'Dairy', to: 'Other', ruleError: null, departmentsAdded: 0, store: null });
   assert.equal(sent[0].identifier, 'c-other');
   assert.equal(sent[0].categoryGroupId, GROUP);
   await assert.rejects(c.setItemCategory('Sosiski', 'Deli'), /^Error: Category "Deli" not found/);

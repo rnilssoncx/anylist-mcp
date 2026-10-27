@@ -109,7 +109,8 @@ function connected(stores, items = []) {
   const calls = [];
   const c = new AnyListClient({ username: 'u', password: 'p' });
   c.targetList = {
-    name: 'Groceries', stores, items,
+    identifier: 'list-1', name: 'Groceries', stores, items,
+    categoryGroups: [{ identifier: 'b907355ef26d5331849d1d5fe1f23a61', categories: [] }],
     createStore: async name => { calls.push(['create', name]); return { name }; },
     renameStore: async (id, name) => { calls.push(['rename', id, name]); stores.find(s => s.identifier === id).name = name; },
     deleteStore: async id => { calls.push(['delete', id]); },

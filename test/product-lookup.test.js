@@ -84,7 +84,9 @@ function mcpClient(items = []) {
   const added = [];
   const client = new AnyListClient({ username: "u", password: "p" });
   client.client = any;
-  client.targetList = { name: "Test", items, addItem: async item => { added.push(item); } };
+  // A list has its main category set, which lookups now name; this one is empty.
+  client.targetList = { identifier: "list-1", name: "Test", items, categoryGroups: [{ identifier: "b907355ef26d5331849d1d5fe1f23a61", categories: [] }],
+                        addItem: async item => { added.push(item); } };
   return { client, any, added };
 }
 

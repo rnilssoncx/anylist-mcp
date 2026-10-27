@@ -1,6 +1,43 @@
+import { createRequire } from 'node:module';
 import AnyList from '../anylist-js/lib/index.js';
 import Item from '../anylist-js/lib/item.js';
 import { normalizeRecipe } from './recipe-normalizer.js';
+
+const uuidv5 = createRequire(import.meta.url)('uuid/v5');
+
+// AnyList's web client takes a list's default category set to be the one whose
+// id is uuid5(list id, this namespace). Per BookCatKid/aioanylist.
+const MAIN_SET_NAMESPACE = 'f656a81f-0e0a-419a-a451-21f4f2eac51b';
+const MAX_ROWS = 25;
+
+export const NO_MAIN_SET = "Couldn't tell which category set is the list's main one, so nothing was changed";
+
+export function noStoreView(store) {
+  return `No store view for "${store}". Make one in the AnyList app: a category set for ${store}, then a store filter for ${store} that uses it`;
+}
+
+export function usesMainCategories(store) {
+  return `The "${store}" store view uses the main categories, so there is no ${store} set to sort into. In the AnyList app, give it its own category set`;
+}
+
+export function notInStoreSet(category, store) {
+  return `${category} is not a category in the ${store} set, and only "Aisle <number>" is created automatically`;
+}
+
+// "aisle 22", "Aisle 22 ", "AISLE 07" → "Aisle 22" / "Aisle 7". Anything else
+// — "Aisle 22 Dairy", "Aisle 22-23" — is not an aisle this creates.
+function aisleName(text) {
+  const m = /^aisle\s+(\d{1,3})$/i.exec(String(text || '').trim());
+  return m ? `Aisle ${Number(m[1])}` : null;
+}
+
+function aisleNumber(name) {
+  return Number(name.slice('Aisle '.length));
+}
+
+function nextSortIndex(group) {
+  return Math.max(-1, ...group.categories.map(c => c.sortIndex)) + 1;
+}
 
 class AnyListClient {
   /**
@@ -310,7 +347,7 @@ class AnyListClient {
     }
   }
 
-  async getItems(includeChecked = false, includeNotes = false) {
+  async getItems(includeChecked = false, includeNotes = false, includeBarcodes = false) {
     if (!this.targetList) {
       const error = new Error('Not connected to any list. Call connect() first.');
       console.error(error.message);
@@ -336,6 +373,9 @@ class AnyListClient {
         };
         if (includeNotes && item.details) {
           result.note = item.details;
+        }
+        if (includeBarcodes && item.productUpc) {
+          result.barcode = item.productUpc;
         }
         const stores = (item.storeIds || [])
           .map(id => (this.targetList.stores || []).find(s => s.identifier === id))
@@ -488,32 +528,71 @@ class AnyListClient {
   }
 
   // ===== CATEGORIES =====
+  //
+  // A list can hold several category sets ("category groups"): the household's
+  // ordinary one, and one per store view that has its own walk order. Every
+  // lookup here names its set. Taking the first one, or every one, is how a
+  // Kroger aisle would land in the ordinary view — the outcome plans/010 calls
+  // the one that must not happen.
 
-  // Every category on the list, built-in and the household's own, in AnyList's
-  // order. A list with several category groups lists a name once.
-  getCategories() {
+  // The household's ordinary set, by AnyList's own rule: the group whose id is
+  // uuid5(list id, MAIN_SET_NAMESPACE) — true of every list on the account
+  // (checked 2026-10-26). With no such group nothing is guessed, because the
+  // guess is the defect.
+  mainSet() {
     if (!this.targetList) {
       throw new Error('Not connected to any list. Call connect() first.');
     }
-    const seen = new Set();
-    const categories = [];
-    for (const group of this.targetList.categoryGroups || []) {
-      for (const category of [...group.categories].sort((a, b) => a.sortIndex - b.sortIndex)) {
-        if (seen.has(category.name)) continue;
-        seen.add(category.name);
-        categories.push({ ...category, categoryGroupId: group.identifier });
-      }
-    }
-    return categories;
+    const id = uuidv5(this.targetList.identifier, MAIN_SET_NAMESPACE).replace(/-/g, '');
+    const group = (this.targetList.categoryGroups || []).find(g => g.identifier === id);
+    if (!group) throw new Error(NO_MAIN_SET);
+    return group;
+  }
+
+  // The set a store's view uses, found through the store filters by the
+  // store's id — never by a set's or a filter's name, which the household
+  // chooses freely ("Big shop", or a set that happens to be called "Kroger").
+  // Returns the set and AnyList's spelling of the store, which is what the
+  // words say: a sentence about AnyList's set names the store as AnyList does.
+  storeSet(storeName) {
+    const main = this.mainSet();
+    const store = this.findStore(storeName);
+    const filters = store
+      ? (this.targetList.storeFilters || []).filter(f => f.storeIds.includes(store.identifier))
+      : [];
+    // AnyList's spelling once the store is found; the caller's only when it
+    // is not.
+    const named = store ? store.name : storeName;
+    if (filters.length === 0) throw new Error(noStoreView(named));
+    const sets = [...new Set(filters.map(f => f.categoryGroupId).filter(Boolean))];
+    if (sets.length > 1) throw new Error(`Two store views for "${named}" use different category sets, so it is not clear which to sort into`);
+    if (sets.length === 0 || sets[0] === main.identifier) throw new Error(usesMainCategories(named));
+    const group = this.targetList.categoryGroups.find(g => g.identifier === sets[0]);
+    if (!group) throw new Error(`The "${named}" store view uses a category set the list doesn't have, so nothing was changed`);
+    return { group, store: store.name };
+  }
+
+  // Items answering to a name, ignoring case — the rule's own key. Two of them
+  // share one rule, so a move of one would re-file the other on its next add.
+  _itemsNamed(name) {
+    const key = String(name).toLowerCase();
+    return (this.targetList.items || []).filter(i => i.name.toLowerCase() === key);
+  }
+
+  // A set's categories in AnyList's order, each carrying its set's id.
+  getCategories(group = this.mainSet()) {
+    return [...group.categories]
+      .sort((a, b) => a.sortIndex - b.sortIndex)
+      .map(category => ({ ...category, categoryGroupId: group.identifier }));
   }
 
   // A category by its name or its id, matched the way AnyList files items:
   // "Condiments & Dressings", "condiments-oils-and-salad-dressings" and
-  // "penzy's" all find theirs. The first group wins when a list has several.
-  findCategory(nameOrId) {
+  // "penzy's" all find theirs.
+  findCategory(nameOrId, group = this.mainSet()) {
     const key = Item.categoryMatchId({ name: nameOrId });
     if (!key) return null;
-    return this.getCategories().find(c => c.systemCategory === key || Item.categoryMatchId({ name: c.name }) === key) || null;
+    return this.getCategories(group).find(c => c.systemCategory === key || Item.categoryMatchId({ name: c.name }) === key) || null;
   }
 
   categoryNotFound(name) {
@@ -521,35 +600,179 @@ class AnyListClient {
     return `Category "${name}" not found in list "${this.targetList.name}". Available categories: ${available}`;
   }
 
-  // The name of the category an item shows under: its assignment if it has
-  // one, else the category its id files it in, as the apps resolve it.
-  categoryNameOf(item) {
-    const categories = this.getCategories();
-    for (const a of item.categoryAssignments || []) {
-      const assigned = categories.find(c => c.identifier === a.categoryId);
-      if (assigned) return assigned.name;
-    }
+  // The name of the category an item shows under in a set: its assignment
+  // there if it has one, else the category its match id files it in, else the
+  // set's default — as the apps draw it.
+  categoryNameOf(item, group = this.mainSet()) {
+    const categories = this.getCategories(group);
+    const assignment = (item.categoryAssignments || []).find(a => a.categoryGroupId === group.identifier);
+    const assigned = assignment && categories.find(c => c.identifier === assignment.categoryId);
+    if (assigned) return assigned.name;
     const matchId = item.categoryMatchId || 'other';
-    const filed = categories.find(c => Item.categoryMatchId(c) === matchId);
+    const filed = categories.find(c => Item.categoryMatchId(c) === matchId)
+      // A match id the set has no category for is drawn under the set's
+      // default, Other (plans/010, S4, seen in the app).
+      || categories.find(c => c.identifier === group.defaultCategoryId)
+      || categories.find(c => c.systemCategory === 'other');
     return filed ? filed.name : matchId;
   }
 
-  // Returns the category the item was in and the one it is in now, by name.
-  async setItemCategory(itemName, categoryName) {
+  // Every main-set category with a system id is copied into a store's set,
+  // with its name, icon and system id: a set made in the app starts with only
+  // "Other", and the app files an unsorted item under the category whose
+  // system id is its match id — so with the copy, an item Kroger cannot place
+  // shows under its usual department at Kroger rather than in one pile.
+  // Present already means the same system id or the same name, so a second
+  // call, or a department made or renamed by hand, makes nothing. The
+  // household's own categories have no system id and are not copied: a
+  // "Walmart" category has no place in the Kroger walk. Returns how many were
+  // made; one request, refused whole if it fails.
+  async ensureDepartments(group, storeName) {
+    const have = this.getCategories(group);
+    const missing = this.getCategories().filter(m => m.systemCategory && !have.some(c =>
+      c.systemCategory === m.systemCategory || Item.categoryMatchId({ name: c.name }) === Item.categoryMatchId({ name: m.name })));
+    if (missing.length === 0) return 0;
+    let next = Math.max(-1, ...have.map(c => c.sortIndex)) + 1;
+    try {
+      await this.targetList.createCategories(missing.map(m => ({
+        name: m.name, categoryGroupId: group.identifier, systemCategory: m.systemCategory, icon: m.icon || undefined, sortIndex: next++,
+      })));
+    } catch (error) {
+      // "No items were sorted", not "nothing was changed": whether the server
+      // applies a request of several operations all-or-nothing is not
+      // measured, so some departments may exist now. The next call makes the
+      // rest.
+      throw new Error(`Couldn't add the main set's departments to the ${storeName} set, so no items were sorted: ${error.message}`);
+    }
+    return missing.length;
+  }
+
+  // The rule is what the app reads when the item is next added there; without
+  // it, the move is undone by the household's next re-add (plans/010, S5). It
+  // is written after the assignment, so a failed move leaves the rule as it
+  // was. A failure here is returned, not thrown: the item has moved.
+  async _saveRule(item, category) {
+    try {
+      await this.targetList.saveCategorizationRule({
+        itemName: item.name, categoryGroupId: category.categoryGroupId, categoryId: category.identifier,
+      });
+      return null;
+    } catch (error) {
+      return error.message;
+    }
+  }
+
+  // Moves an item, in the main set or — with `store` — in that store's set.
+  // Refusals throw before any write. After the first write, what happened is
+  // returned rather than thrown — `kind` 'moved', 'not-created' (the aisle it
+  // needs could not be made) or 'failed' (the assignment request failed) —
+  // because departments may already have been copied, and the words have to
+  // say so.
+  async setItemCategory(itemName, categoryName, { store = null } = {}) {
     if (!this.targetList) {
       throw new Error('Not connected to any list. Call connect() first.');
     }
+    const { group, store: storeName } = store ? this.storeSet(store) : { group: this.mainSet(), store: null };
     const item = this.targetList.getItemByName(itemName);
     if (!item) {
       throw new Error(`Item "${itemName}" not found in list`);
     }
-    const category = this.findCategory(categoryName);
-    if (!category) {
-      throw new Error(this.categoryNotFound(categoryName));
+    if (this._itemsNamed(itemName).length > 1) {
+      throw new Error(`Two items on the list are called "${itemName}", ignoring case, and AnyList keeps one rule for both, so nothing was changed`);
     }
-    const from = this.categoryNameOf(item);
-    await item.assignCategory(category);
-    return { from, to: category.name };
+    // Checked before the departments are copied, so a refused category writes
+    // nothing: in the store's set already, an aisle, or a main-set department
+    // the copy is about to make.
+    const copied = store && this.findCategory(categoryName)?.systemCategory;
+    if (!this.findCategory(categoryName, group) && !(store && aisleName(categoryName)) && !copied) {
+      throw new Error(store ? notInStoreSet(categoryName, storeName) : this.categoryNotFound(categoryName));
+    }
+    const departmentsAdded = store ? await this.ensureDepartments(group, storeName) : 0;
+    const result = { departmentsAdded, store: storeName };
+    let category = this.findCategory(categoryName, group);
+    if (!category) {
+      try {
+        [category] = await this.targetList.createCategories([{
+          name: aisleName(categoryName), categoryGroupId: group.identifier, sortIndex: nextSortIndex(group),
+        }]);
+      } catch (error) {
+        return { ...result, kind: 'not-created', aisle: aisleName(categoryName), error: error.message };
+      }
+    }
+    const from = this.categoryNameOf(item, group);
+    // The match id only for the main set: it is item-level, and every other
+    // set files an unassigned item by it.
+    try {
+      await item.assignCategory(category, { matchId: !store });
+    } catch (error) {
+      return { ...result, kind: 'failed', error: error.message };
+    }
+    const ruleError = await this._saveRule(item, category);
+    return { ...result, kind: 'moved', from, to: category.name, ruleError };
+  }
+
+  // Up to 25 rows of {name, category} into a store's set. Whole-call refusals
+  // (no main set, no usable store view, departments not copied) throw before
+  // any write; after that each row has its own outcome and one row's failure
+  // does not stop the rest.
+  async setItemCategories(storeName, rows) {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    if (rows.length > MAX_ROWS) throw new Error(`At most ${MAX_ROWS} items at a time — this call had ${rows.length}`);
+    const { group, store } = this.storeSet(storeName);
+    const departmentsAdded = await this.ensureDepartments(group, store);
+
+    const outcomes = rows.map(row => {
+      const named = this._itemsNamed(row.name);
+      if (named.length === 0) return { name: row.name, kind: 'not-on-list' };
+      if (named.length > 1) return { name: row.name, kind: 'duplicate' };
+      const category = this.findCategory(row.category, group);
+      if (category) return { name: row.name, item: named[0], category };
+      if (aisleName(row.category)) return { name: row.name, item: named[0], aisle: aisleName(row.category) };
+      return { name: row.name, kind: 'refused', asked: row.category };
+    });
+
+    // The aisles the rows need and the set lacks, made in one request in
+    // number order — the order Kroger's aisles are walked until someone drags
+    // them.
+    const needed = [...new Set(outcomes.filter(o => o.aisle).map(o => o.aisle))]
+      .filter(name => !this.findCategory(name, group))
+      .sort((a, b) => aisleNumber(a) - aisleNumber(b));
+    let createError = null;
+    if (needed.length) {
+      let next = nextSortIndex(group);
+      try {
+        await this.targetList.createCategories(needed.map(name => ({ name, categoryGroupId: group.identifier, sortIndex: next++ })));
+      } catch (error) {
+        createError = error.message;
+      }
+    }
+    for (const o of outcomes.filter(o => o.aisle)) {
+      if (createError && needed.includes(o.aisle)) Object.assign(o, { kind: 'not-created', error: createError });
+      else o.category = this.findCategory(o.aisle, group);
+    }
+
+    for (const o of outcomes.filter(o => o.category && !o.kind)) {
+      try {
+        await o.item.assignCategory(o.category, { matchId: false });
+      } catch (error) {
+        Object.assign(o, { kind: 'failed', error: error.message });
+        continue;
+      }
+      o.kind = 'assigned';
+      o.ruleError = await this._saveRule(o.item, o.category);
+    }
+
+    // A new aisle is said once: on the first row that landed in it, or — when
+    // none did — on the first that tried, which then says the aisle is empty.
+    if (!createError) {
+      for (const aisle of needed) {
+        const rowsIn = outcomes.filter(o => o.aisle === aisle);
+        (rowsIn.find(o => o.kind === 'assigned') || rowsIn[0]).created = true;
+      }
+    }
+    return { departmentsAdded, outcomes, store };
   }
 
   // ===== RECIPES =====

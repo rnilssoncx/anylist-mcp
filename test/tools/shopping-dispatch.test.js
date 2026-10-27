@@ -43,7 +43,7 @@ describe('shopping dispatch', () => {
     assert.ok(actions.includes('set_item_store'), 'the schema this test reads has changed shape');
     // The handler tests call the handler directly, so an action dropped from
     // the schema — unreachable for any client — passes all of them.
-    for (const action of ['update_item', 'set_item_category', 'list_categories', 'create_store', 'rename_store', 'delete_store']) {
+    for (const action of ['update_item', 'set_item_category', 'set_item_categories', 'list_categories', 'create_store', 'rename_store', 'delete_store']) {
       assert.ok(actions.includes(action), `${action} is not in the schema`);
     }
 

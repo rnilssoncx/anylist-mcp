@@ -109,7 +109,10 @@ function storesFixture(storeIds) {
   const set = [];
   const item = { name: 'Chips', storeIds, setStores: async ids => { set.push(ids); } };
   const c = connected(library(() => [{
-    name: 'Groceries', items: [item],
+    identifier: 'list-1', name: 'Groceries', items: [item],
+    // getItems names each item's category in the main set, whose id is
+    // AnyList's uuid5 of the list id.
+    categoryGroups: [{ identifier: 'b907355ef26d5331849d1d5fe1f23a61', categories: [] }],
     stores: [{ name: 'Trader Joe’s', identifier: 'tj' }, { name: 'H.E.B.', identifier: 'heb' }, { name: 'Kroger', identifier: 'kr' }],
   }]));
   return { c, set };
