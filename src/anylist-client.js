@@ -16,6 +16,39 @@ export function noStoreView(store) {
   return `No store view for "${store}". Make one in the AnyList app: a category set for ${store}, then a store filter for ${store} that uses it`;
 }
 
+// § Recent Items and barcodes: every string here is pinned by a test.
+export function notInRecents(name) {
+  return `"${name}" is not in Recent Items`;
+}
+
+export function severalRecents(name, spellings) {
+  return `Several Recent Items match "${name}": ${spellings.map(s => `"${s}"`).join(", ")}. Give the exact name`;
+}
+
+export function recentRepeated(name, count) {
+  return `"${name}" is in Recent Items ${count} times, so it is not clear which to rename. remove_recent removes every copy`;
+}
+
+export function recentClash(existing, from) {
+  return `"${existing}" is already in Recent Items, so renaming "${from}" would make a second. Remove "${from}" instead`;
+}
+
+export function partlyRemoved(name, done, count, error) {
+  return `Removed ${done} of ${count} copies of "${name}" from Recent Items, then: ${error}`;
+}
+
+export function twoItemsNamed(name) {
+  return `Two items are called "${name}", so it is not clear which one is the product. Rename one first`;
+}
+
+export function alreadyProduct(name, upc) {
+  return `"${name}" is already the product with barcode ${upc}. For a different product, add it by barcode instead`;
+}
+
+export function itemHasBarcode(name, upc) {
+  return `"${name}" already has barcode ${upc}, and adding by barcode finds only one item`;
+}
+
 export function usesMainCategories(store) {
   return `The "${store}" store view uses the main categories, so there is no ${store} set to sort into. In the AnyList app, give it its own category set`;
 }
@@ -457,6 +490,10 @@ class AnyListClient {
   // Changes an item already on the list. Fields left undefined are untouched.
   // A new name that another item already has is refused: every lookup here is
   // by name, so two items sharing one would make the second unreachable.
+  //
+  // Returns the item's name and, for a rename, what happened to its rules and
+  // its Recent Items entry (_carryName) — both written after the rename, so
+  // their failures are reported, not thrown: the item has its new name.
   async updateItem(itemName, { newName, quantity, notes } = {}) {
     if (!this.targetList) {
       throw new Error('Not connected to any list. Call connect() first.');
@@ -465,19 +502,209 @@ class AnyListClient {
     if (!item) {
       throw new Error(`Item "${itemName}" not found in list`);
     }
+    const oldName = item.name;
     if (newName !== undefined) {
       const cleanName = String(newName).trim();
       if (!cleanName) throw new Error('New name is required.');
-      const other = this.targetList.getItemByName(cleanName);
-      if (other && other !== item) {
-        throw new Error(`An item named "${other.name}" is already on the list${other.checked ? " (checked off)" : ""}`);
-      }
+      this._refuseNameClash(item, cleanName);
       item.name = cleanName;
     }
     if (notes !== undefined) item.details = notes;
+    // Where the item is filed, read before anything is written.
+    const rules = newName !== undefined ? this._rulesFor(item) : [];
     if (newName !== undefined || notes !== undefined) await item.save();
     if (quantity !== undefined) await item.setQuantity(quantity);
-    return item.name;
+    const carried = item.name !== oldName ? await this._carryName(item, oldName, rules) : null;
+    return { name: item.name, ...carried };
+  }
+
+  // Ignoring case: the categorisation rule is keyed on the lowercased name, so
+  // two items differing only in case would share one, and a move of either
+  // would re-file the other on its next add. `getItemByName` is exact, and a
+  // check through it let "milk" be made beside "Milk".
+  _refuseNameClash(item, name) {
+    const other = this._itemsNamed(name).find(i => i !== item);
+    if (other) {
+      throw new Error(`An item named "${other.name}" is already on the list${other.checked ? " (checked off)" : ""}`);
+    }
+  }
+
+  // The category the item is filed in, in every set where it has one: its
+  // assignment there, and in the main set the category its match id files it
+  // in. A rename writes a rule under the new name for each, so the app's next
+  // add of the new name files it where it is filed now (plans/010, S5).
+  // A store set the item has no assignment in needs none — the app falls back
+  // to the match id there, rule or not. Nor does an item that is merely
+  // unfiled: a typo AnyList could not place sits in Other, and a rule would
+  // pin the corrected name there for good, where AnyList would have placed it.
+  // Without a main set, store sets' assignments still give theirs.
+  _rulesFor(item) {
+    let mainId = null;
+    try {
+      mainId = this.mainSet().identifier;
+    } catch { /* no main set: only assignments name a category */ }
+    const out = [];
+    for (const group of this.targetList.categoryGroups || []) {
+      const categories = this.getCategories(group);
+      const assignment = (item.categoryAssignments || []).find(a => a.categoryGroupId === group.identifier);
+      let category = assignment && categories.find(c => c.identifier === assignment.categoryId);
+      if (!category && group.identifier === mainId) category = this._filedByMatchId(item, categories);
+      if (category) out.push(category);
+    }
+    return out;
+  }
+
+  // The category an item's match id files it in, or null when the match id
+  // is the default or names no category — the item is unfiled.
+  _filedByMatchId(item, categories) {
+    const matchId = item.categoryMatchId || 'other';
+    if (matchId === 'other') return null;
+    return categories.find(c => Item.categoryMatchId(c) === matchId) || null;
+  }
+
+  // After an item's name has changed: its rules under the new name, and its
+  // Recent Items entry. Recents keeps the name an entry was added under, so
+  // the 22 renames of 2026-10-26 left their old names there, and tapping one
+  // would add a typed item beside the product. A case-only change needs no new
+  // rule — the rule's key is the lowercased name — but does need the entry,
+  // which is the half the first cleanup missed ("mayo" beside "Mayo").
+  async _carryName(item, oldName, rules) {
+    const sameKey = oldName.toLowerCase() === item.name.toLowerCase();
+    const ruleErrors = [];
+    for (const category of sameKey ? [] : rules) {
+      const error = await this._saveRule(item, category);
+      if (error) ruleErrors.push(error);
+    }
+    return { ruleError: ruleErrors[0] || null, recent: await this._carryRecent(oldName, item.name) };
+  }
+
+  // `renamed`, `removed` (the new name was in Recents already, so the old
+  // entry went rather than making a second), `none` (no entry by the old
+  // name), or `failed` with the error. Ignoring case on both names, and
+  // leaving one entry spelt exactly as the item now is: an entry differing
+  // from its item only in case is what the second cleanup of 2026-10-26 had
+  // to remove by hand. Several requests, so a failure part-way leaves an
+  // unknown state, and the words say so rather than guess which.
+  // Never thrown: the item is renamed by now.
+  async _carryRecent(oldName, newName) {
+    try {
+      const all = this._recents();
+      const key = s => s.toLowerCase();
+      const entries = all.filter(i => key(i.name) === key(oldName));
+      if (entries.length === 0) return { kind: 'none' };
+      const there = all.find(i => !entries.includes(i) && key(i.name) === key(newName));
+      const keep = there || entries.find(i => i.name === newName) || entries[0];
+      if (keep.name !== newName) await this.client.renameRecentItem(keep, newName);
+      for (const entry of entries.filter(i => i !== keep)) await this.client.removeRecentItem(entry);
+      return { kind: there ? 'removed' : 'renamed' };
+    } catch (error) {
+      return { kind: 'failed', error: error.message };
+    }
+  }
+
+  // Makes an item already on the list the product a barcode names — AnyList's
+  // name for it unless `name` is given, the barcode and the photo — keeping
+  // its id, categories and stores, then carries its rules and Recents entry as
+  // a rename does. An unfiled item is filed where AnyList files the product,
+  // as add_by_upc would have. Refusals throw before anything is written; the
+  // lookup before them only reads.
+  //
+  // `photo` is 'new', 'kept' (the product has none, and the item keeps its
+  // own) or 'none'.
+  async setItemProduct(itemName, upc, { name = null } = {}) {
+    if (!this.targetList) throw new Error('Not connected to any list. Call connect() first.');
+    const named = (this.targetList.items || []).filter(i => i.name === itemName);
+    if (named.length === 0) throw new Error(`Item "${itemName}" not found in list`);
+    if (named.length > 1) throw new Error(twoItemsNamed(itemName));
+    const [item] = named;
+    const product = await this.lookupUpc(upc);
+    if (!product) return { kind: 'no-product' };
+    // AnyList's own form of the barcode, as addProduct stores it: the digits
+    // given may be a 12-digit UPC-A, and findItemByUpc matches exactly.
+    const barcode = product.productUpc || upc;
+    // Not a different product renamed: a scanned item's name, barcode and
+    // photo are what make it that product.
+    if (item.productUpc && item.productUpc !== barcode) throw new Error(alreadyProduct(item.name, item.productUpc));
+    const holder = this.findItemByUpc(barcode);
+    // Re-adding by barcode finds the first item carrying it, so a second one
+    // could never be reached that way.
+    if (holder && holder !== item) throw new Error(itemHasBarcode(holder.name, barcode));
+    // Third-party text becomes a name and a line of the reply: one line.
+    const finalName = String(name ?? product.name).replace(/\s+/g, ' ').trim();
+    if (!finalName) throw new Error('New name is required.');
+    this._refuseNameClash(item, finalName);
+    const oldName = item.name;
+    const rules = this._rulesFor(item);
+    const main = this.mainSet();
+    const unfiled = !(item.categoryAssignments || []).some(a => a.categoryGroupId === main.identifier)
+      && !this._filedByMatchId(item, this.getCategories(main));
+    const photoId = (product.photoIds || [])[0] || null;
+    await item.setProduct({ name: finalName, productUpc: barcode, photoId });
+    const carried = finalName !== oldName ? await this._carryName(item, oldName, rules) : { ruleError: null, recent: null };
+    let filed = null;
+    const category = unfiled && product.categoryMatchId ? this.findCategory(product.categoryMatchId, main) : null;
+    if (category && Item.categoryMatchId(category) !== 'other') {
+      const moved = await this.setItemCategory(finalName, category.name);
+      filed = moved.kind === 'moved' ? { category: category.name, ruleError: moved.ruleError } : { category: category.name, error: moved.error };
+    }
+    const photo = photoId ? 'new' : (item.photoIds || []).length ? 'kept' : 'none';
+    return { kind: 'done', from: oldName, name: finalName, productName: product.name, barcode, photo, filed, ...carried };
+  }
+
+  // ===== RECENT ITEMS =====
+  //
+  // A starter list of its own beside the list (200 entries on the
+  // household's), each entry
+  // under the name it was added with. These are for entries no rename carries:
+  // typos, and things bought once under a name nobody uses now.
+
+  _recents() {
+    return this.client.getRecentItemsByListId(this.targetList.identifier) || [];
+  }
+
+  // An exact name, else one matching ignoring case. Entries differing only in
+  // case are different entries, and which is meant is a question.
+  _findRecent(name) {
+    const all = this._recents();
+    const exact = all.filter(i => i.name === name);
+    if (exact.length) return exact;
+    const loose = all.filter(i => i.name.toLowerCase() === String(name).toLowerCase());
+    const spellings = [...new Set(loose.map(i => i.name))];
+    if (spellings.length > 1) throw new Error(severalRecents(name, spellings));
+    if (loose.length === 0) throw new Error(notInRecents(name));
+    return loose;
+  }
+
+  async renameRecentItem(name, newName) {
+    if (!this.targetList) throw new Error('Not connected to any list. Call connect() first.');
+    const cleanName = String(newName || '').trim();
+    if (!cleanName) throw new Error('New name is required.');
+    const entries = this._findRecent(name);
+    const from = entries[0].name;
+    if (entries.length > 1) throw new Error(recentRepeated(from, entries.length));
+    const clash = this._recents().find(i => i !== entries[0] && i.name.toLowerCase() === cleanName.toLowerCase());
+    if (clash) throw new Error(recentClash(clash.name, from));
+    if (from === cleanName) return { from, to: cleanName, changed: false };
+    await this.client.renameRecentItem(entries[0], cleanName);
+    return { from, to: cleanName, changed: true };
+  }
+
+  // Every entry under the name: two copies of one name are one name to the
+  // person asking.
+  async removeRecentItem(name) {
+    if (!this.targetList) throw new Error('Not connected to any list. Call connect() first.');
+    const entries = this._findRecent(name);
+    let done = 0;
+    try {
+      for (const entry of entries) {
+        await this.client.removeRecentItem(entry);
+        done++;
+      }
+    } catch (error) {
+      if (done === 0) throw error;
+      throw new Error(partlyRemoved(entries[0].name, done, entries.length, error.message));
+    }
+    return { name: entries[0].name, count: entries.length };
   }
 
   findStore(storeName) {

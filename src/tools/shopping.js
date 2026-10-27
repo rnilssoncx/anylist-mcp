@@ -3,6 +3,16 @@ import { textResponse, errorResponse } from "./helpers.js";
 import { createElicitationHelpers } from "./elicitation.js";
 import { storeNameKey } from "../anylist-client.js";
 
+// § What a rename did beyond the item: every string here is pinned by a test.
+function carriedText(from, to, { ruleError, recent }) {
+  const lines = [];
+  if (ruleError) lines.push(`AnyList's rule for "${to}" wasn't saved, so re-adding it from the app may file it elsewhere: ${ruleError}`);
+  if (recent?.kind === "renamed") lines.push(`Its Recent Items entry is renamed too.`);
+  if (recent?.kind === "removed") lines.push(`Its old Recent Items entry "${from}" is removed — "${to}" was there already.`);
+  if (recent?.kind === "failed") lines.push(`Recent Items may not be fully updated — check for "${from}" there, since tapping it would add a second item: ${recent.error}`);
+  return lines;
+}
+
   // TODO: What does this do?
 function buildDescription(stores) {
   const base = `Manage AnyList shopping lists and items. Actions:
@@ -10,7 +20,8 @@ function buildDescription(stores) {
 - list_items: Show items on a list (grouped by category)
 - add_item: Add an item to a list. A name is matched against items already saved on the list (specific products, often scanned): one match is re-added, several are listed back without adding anything — ask which one, or resend with exact: true
 - add_items: Add several items to a list in one call (use this instead of repeating add_item); entries are matched the same way
-- update_item: Change an item already on the list — its name (new_name), quantity or notes. Its stores, barcode and photo are kept
+- update_item: Change an item already on the list — its name (new_name), quantity or notes. Its stores, barcode and photo are kept, and a rename carries its Recent Items entry with it
+- set_item_barcode: Make an item already on the list a product, by barcode (upc): it takes AnyList's name for the product (or new_name), the barcode and the photo, and keeps its categories and stores. A barcode can come from the Kroger server's check_stock
 - set_item_category: Move an item already on the list into a category (category). With store, the category is in that store's own category set — its view in the app — and the ordinary categories are left as they are
 - set_item_categories: File up to 25 items in a store's category set at once (store, and items as {name, category}) — e.g. Kroger aisles from the Kroger server's aisles tool. Names must be exactly as on the list; "Aisle <number>" is created when the set lacks it
 - list_items: include_barcodes adds each scanned item's barcode, for looking it up elsewhere
@@ -21,6 +32,8 @@ function buildDescription(stores) {
 - delete_item: Permanently remove an item from a list
 - get_favorites: Get favorite items for a list
 - get_recents: Get recently added items for a list
+- rename_recent: Rename an entry in Recent Items (name, new_name) — the app's list of things added before, kept apart from the list. update_item already renames an item's entry; this is for entries no item carries
+- remove_recent: Remove an entry from Recent Items (name). The item on the list, if there is one, is untouched
 - list_stores: list stores available for the list (if any)
 - create_store: Add a store to the list (store_name)
 - rename_store: Rename a store (store_name, new_store_name); items assigned to it stay assigned
@@ -112,6 +125,19 @@ export function register(server, getClient) {
     return await elicitItemChoice(itemName, matches);
   }
 
+  // Checked or not: a barcode is mostly given for a saved item — the typed
+  // name in the list's history that should have been the product. The whole
+  // name, ignoring case, and no part of one: "butter" finding the one butter
+  // on the list would make it a different product without anyone choosing it.
+  async function resolveWholeItemName(client, itemName) {
+    if (client.targetList.getItemByName(itemName)) return itemName;
+    const lower = itemName.toLowerCase();
+    const matches = [...new Set((client.targetList.items || []).map(i => i.name).filter(n => n.toLowerCase() === lower))];
+    if (matches.length === 0) throw new Error(`Item "${itemName}" not found in list — set_item_barcode needs the item's whole name, as list_items shows it`);
+    if (matches.length === 1) return matches[0];
+    return await elicitItemChoice(itemName, matches);
+  }
+
   // Items already on the list, checked or not, are specific products — a
   // scanned "Beemster Swiss Cheese" with its store, not "cheese". Re-adding one
   // by its exact name keeps all of that, so a requested name is matched against
@@ -179,11 +205,12 @@ export function register(server, getClient) {
     inputSchema: {
       action: z.enum(["list_lists", "list_items", "add_item", "add_items",
         "update_item", "set_item_category", "set_item_categories", "list_categories", "set_item_store", "check_item", "uncheck_item", "delete_item", "get_favorites", "get_recents", "list_stores",
-        "create_store", "rename_store", "delete_store", "lookup_upc", "add_by_upc"]).describe("The shopping action to perform"),
-      upc: z.string().optional().describe("Barcode digits (lookup_upc and add_by_upc only)"),
+        "create_store", "rename_store", "delete_store", "lookup_upc", "add_by_upc",
+        "set_item_barcode", "rename_recent", "remove_recent"]).describe("The shopping action to perform"),
+      upc: z.string().optional().describe("Barcode digits (lookup_upc, add_by_upc and set_item_barcode only)"),
       list_name: z.string().optional().describe("Name of the list (defaults to configured default list)"),
-      name: z.string().optional().describe("Item name (required for add_item, update_item, set_item_store, check_item, uncheck_item, delete_item)"),
-      new_name: z.string().optional().describe("The item's new name (update_item only)"),
+      name: z.string().optional().describe("Item name (required for add_item, update_item, set_item_barcode, set_item_store, check_item, uncheck_item, delete_item), or the Recent Items entry (rename_recent, remove_recent)"),
+      new_name: z.string().optional().describe("The new name (update_item, rename_recent; set_item_barcode to keep a name other than AnyList's)"),
       items: z.array(z.union([
         z.string(),
         z.object({
@@ -374,13 +401,44 @@ export function register(server, getClient) {
           }
           await client.connect(list_name);
           const resolved = await resolveItemName(client, itemName);
-          const finalName = await client.updateItem(resolved, changes);
+          const result = await client.updateItem(resolved, changes);
           const done = [
-            changes.newName !== undefined && `renamed to "${finalName}"`,
+            changes.newName !== undefined && `renamed to "${result.name}"`,
             quantity !== undefined && `quantity ${quantity}`,
             notes !== undefined && (notes ? `notes "${notes}"` : "notes cleared"),
           ].filter(Boolean);
-          return textResponse(`Updated "${resolved}": ${done.join(", ")}`);
+          return textResponse([`Updated "${resolved}": ${done.join(", ")}`, ...carriedText(resolved, result.name, result)].join("\n"));
+        }
+        case "set_item_barcode": {
+          const upc = normaliseUpc(params.upc);
+          let itemName = name;
+          if (!itemName) itemName = await elicitRequiredField("name", "Which item is this barcode for?");
+          await client.connect(list_name);
+          const resolved = await resolveWholeItemName(client, itemName);
+          const result = await client.setItemProduct(resolved, upc, { name: params.new_name ?? null });
+          if (result.kind === "no-product") return textResponse(`${noProductText(upc)}\nNothing was changed.`);
+          const called = result.name !== result.productName ? ` (AnyList calls it "${result.productName}")` : "";
+          const photo = { new: ", with its photo", kept: ", keeping the photo it had — AnyList has none for the product", none: ", without a photo — AnyList has none for it" }[result.photo];
+          const filed = !result.filed ? []
+            : result.filed.error ? [`It is still unfiled: AnyList's category for it, "${result.filed.category}", couldn't be set: ${result.filed.error}`]
+            : [`Filed under "${result.filed.category}", where AnyList files the product${ruleText(result.filed.ruleError)}.`];
+          return textResponse([`"${result.from}" is now the product with barcode ${result.barcode}, named "${result.name}"${called}${photo}.`,
+            ...filed, ...carriedText(result.from, result.name, result)].join("\n"));
+        }
+        case "rename_recent": {
+          if (!name) return errorResponse(`rename_recent needs name: the Recent Items entry`);
+          if (!params.new_name) return errorResponse(`rename_recent needs new_name`);
+          await client.connect(list_name || null);
+          const { from, to, changed } = await client.renameRecentItem(name, params.new_name);
+          return textResponse(changed
+            ? `Renamed "${from}" to "${to}" in Recent Items`
+            : `"${from}" is already called that in Recent Items`);
+        }
+        case "remove_recent": {
+          if (!name) return errorResponse(`remove_recent needs name: the Recent Items entry`);
+          await client.connect(list_name || null);
+          const { name: removed, count } = await client.removeRecentItem(name);
+          return textResponse(`Removed "${removed}" from Recent Items${count > 1 ? ` (${count} copies)` : ""}. The list itself is unchanged`);
         }
         case "set_item_category": {
           let itemName = name;

@@ -85,7 +85,7 @@ function connected(items) {
 
 test('updateItem renames, sets notes and quantity, and touches nothing it was not given', async () => {
   const { c, calls } = connected([{ name: 'Eggs', details: 'brown' }]);
-  assert.equal(await c.updateItem('Eggs', { newName: '  Eggs, large ', quantity: '2 dozen' }), 'Eggs, large');
+  assert.equal((await c.updateItem('Eggs', { newName: '  Eggs, large ', quantity: '2 dozen' })).name, 'Eggs, large');
   assert.deepEqual(calls, [['save', 'Eggs, large', 'brown'], ['quantity', 'Eggs, large', '2 dozen']]);
 });
 

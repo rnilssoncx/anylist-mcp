@@ -181,7 +181,7 @@ export class MockAnyListClient {
     if (newName !== undefined) item.name = newName;
     if (quantity !== undefined) item.quantity = quantity;
     if (notes !== undefined) item.notes = notes;
-    return item.name;
+    return { name: item.name, ruleError: null, recent: null };
   }
 
   async createStore(name) {
