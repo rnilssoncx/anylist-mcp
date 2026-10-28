@@ -45,6 +45,26 @@ describe('ANYLIST_STATIC_TOKEN in the bearer check', () => {
     assert.deepEqual([res.statusCode, res.body], [401, { error: 'invalid_token' }]);
   });
 
+  it('logs no character of a header whose space after Bearer was lost', () => {
+    // The known connector mistake: "Bearer" glued to the token. The log goes to
+    // Loki for 30 days, so not even the token's first few characters may reach it.
+    on();
+    const glued = 'k7Q2xZ9wP4mV8nR3sT6y' + 'a'.repeat(28);
+    const lines = [];
+    const log = console.log;
+    console.log = (...a) => lines.push(a.join(' '));
+    try {
+      const req = { headers: { authorization: `Bearer${glued}` }, method: 'POST', path: '/mcp', ip: '127.0.0.1', protocol: 'http', get: () => 'x.test' };
+      const res = { setHeader() {}, status() { return this; }, json() { return this; } };
+      requireBearerToken(req, res, () => assert.fail('a glued header must not pass'));
+    } finally {
+      console.log = log;
+    }
+    const text = lines.join('\n');
+    assert.match(text, /starts_bearer=true has_space=false length=54/);
+    for (let n = 3; n <= glued.length; n++) assert.ok(!text.includes(glued.slice(0, n)), `the log carries the token's first ${n} characters`);
+  });
+
   it('refuses a prefix of the token', () => {
     on();
     assert.equal(call(TOKEN.slice(0, 47)).nexted, false);

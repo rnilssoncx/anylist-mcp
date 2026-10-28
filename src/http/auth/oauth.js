@@ -430,7 +430,11 @@ function issueCodeAndRedirect(req, res, userId, oauth) {
 export function requireBearerToken(req, res, next) {
   const auth = req.headers["authorization"] || "";
   if (!auth.startsWith("Bearer ")) {
-    console.log(`[oauth] ANOMALOUS bearer missing/wrong auth header: method=${req.method} path=${req.path} auth=${auth ? auth.slice(0, 20) + "…" : "none"} ip=${req.ip}`);
+    // None of the header's characters, only its shape: the commonest way to
+    // get here is a connector whose space after "Bearer" was lost, and then
+    // the characters after the scheme ARE the token — even a cut-down scheme
+    // word would carry its first few into the log, and the log goes to Loki.
+    console.log(`[oauth] ANOMALOUS bearer missing/wrong auth header: method=${req.method} path=${req.path} header=${auth ? `starts_bearer=${/^bearer/i.test(auth)} has_space=${/^\S+\s/.test(auth)} length=${auth.length}` : "none"} ip=${req.ip}`);
     res.setHeader("WWW-Authenticate", `Bearer realm="${baseUrl(req)}", resource_metadata="${baseUrl(req)}/.well-known/oauth-protected-resource"`);
     return res.status(401).json({ error: "unauthorized" });
   }
