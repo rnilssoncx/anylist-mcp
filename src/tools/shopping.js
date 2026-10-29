@@ -1,7 +1,10 @@
 import { z } from "zod";
 import { textResponse, errorResponse } from "./helpers.js";
 import { createElicitationHelpers } from "./elicitation.js";
-import { storeNameKey } from "../anylist-client.js";
+import fs from "node:fs";
+import path from "node:path";
+import AnyListClient, { storeNameKey } from "../anylist-client.js";
+import { DATE, exportName, readExport } from "../export.js";
 
 // § What a rename did beyond the item: every string here is pinned by a test.
 function carriedText(from, to, { ruleError, recent }) {
@@ -18,6 +21,7 @@ function buildDescription(stores) {
   const base = `Manage AnyList shopping lists and items. Actions:
 - list_lists: Show all lists with item counts
 - list_items: Show items on a list (grouped by category)
+- list_items_as_of: Show a list as a nightly saved copy had it (date, YYYY-MM-DD; without a date, says which copies there are). Read only — put items back with add_items; they come back without their barcodes and stores
 - add_item: Add an item to a list. A name is matched against items already saved on the list (specific products, often scanned): one match is re-added, several are listed back without adding anything — ask which one, or resend with exact: true
 - add_items: Add several items to a list in one call (use this instead of repeating add_item); entries are matched the same way
 - update_item: Change an item already on the list — its name (new_name), quantity or notes. Its stores, barcode and photo are kept, and a rename carries its Recent Items entry with it
@@ -94,7 +98,120 @@ async function validateStoreName(client, storeName) {
   return { valid: true, message: null };
 }
 
-export function register(server, getClient) {
+// list_items' text, shared with list_items_as_of so a saved copy reads exactly
+// as the list does today. `label` is the quoted list name, plus which copy.
+function itemsText(label, items, includeChecked) {
+  if (items.length === 0) {
+    return includeChecked ? `List ${label} is empty.` : `No unchecked items on list ${label}.`;
+  }
+  const itemsByCategory = {};
+  items.forEach(item => {
+    const cat = item.category || 'other';
+    if (!itemsByCategory[cat]) itemsByCategory[cat] = [];
+    itemsByCategory[cat].push(item);
+  });
+  const itemList = Object.keys(itemsByCategory).sort().map(category => {
+    const categoryItems = itemsByCategory[category].map(item => {
+      const qRaw = item.quantity == null ? "" : String(item.quantity).trim();
+      const qty = (qRaw && qRaw !== "1") ? ` (${qRaw})` : "";
+      const status = item.checked ? " ✓" : "";
+      const note = item.note ? ` [${item.note}]` : "";
+      const store = item.store ? ` @${item.store}` : "";
+      const barcode = item.barcode ? ` [barcode ${item.barcode}]` : "";
+      return `  - ${item.name}${barcode}${qty}${status}${note}${store}`;
+    }).join("\n");
+    return `**${category}**\n${categoryItems}`;
+  }).join("\n\n");
+  return `Shopping list ${label} (${items.length} items):\n${itemList}`;
+}
+
+// § 1c's words (moneypenny plans/012), verbatim from its table where a row
+// applies; `noDate` is this action's own. Every string is pinned by a test.
+// `unreadable` stops short of the table's "Nothing was changed.": that sentence
+// is restore's, and this action only reads, so saying it would imply it might
+// have changed something.
+export const asOfWords = {
+  badDate: date => `"${date}" is not a date; give it as YYYY-MM-DD.`,
+  noneReadable: list => `No saved copies are readable here, so I can't tell what "${list}" used to be.`,
+  someUnreadable: dates => ` Couldn't read ${dates.length} saved copies: ${dates.join(", ")}.`,
+  noCopy: (date, dates) => `There is no saved copy from ${date}. Saved copies: ${dates.join(", ")}.`,
+  unreadable: (date, error) => `Couldn't read the ${date} copy: ${error}.`,
+  notInCopy: (list, date) => `"${list}" was not in the ${date} copy.`,
+  noDate: (list, dates) => `Saved copies: ${dates.join(", ")}. Say which date to show "${list}" from.`,
+};
+
+const COPY_NAME = /^anylist-([0-9]{4}-[0-9]{2}-[0-9]{2})\.json\.gz$/;
+
+// Every copy in the directory, sorted by date, split by whether it reads. A
+// directory that cannot be listed — unmounted, or not there — has no readable
+// copies, which the words call "can't tell": an empty /export is never
+// "nothing was there". A `.tmp` never matches, so a half-written night is not
+// a copy.
+function savedCopies(exportDir) {
+  let names;
+  try {
+    names = fs.readdirSync(exportDir);
+  } catch {
+    names = [];
+  }
+  const readable = [];
+  const unreadable = [];
+  for (const date of names.map(n => COPY_NAME.exec(n)?.[1]).filter(Boolean).sort()) {
+    try {
+      readExport(path.join(exportDir, exportName(date)));
+      readable.push(date);
+    } catch {
+      unreadable.push(date);
+    }
+  }
+  return { readable, unreadable };
+}
+
+async function itemsAsOf(exportDir, listName, date, { include_checked, include_notes, include_barcodes }) {
+  if (date == null) {
+    const { readable, unreadable } = savedCopies(exportDir);
+    const tail = unreadable.length ? asOfWords.someUnreadable(unreadable) : "";
+    if (readable.length === 0) return errorResponse(asOfWords.noneReadable(listName) + tail);
+    return textResponse(asOfWords.noDate(listName, readable) + tail);
+  }
+  // Before the date is any part of a path: "../x" would name a file outside
+  // the directory.
+  if (!DATE.test(date)) return errorResponse(asOfWords.badDate(date));
+  let data;
+  try {
+    data = readExport(path.join(exportDir, exportName(date)));
+  } catch (error) {
+    // A copy that is there and unreadable is not a copy that is absent.
+    if (error.code !== "ENOENT") return errorResponse(asOfWords.unreadable(date, error.message));
+    const { readable, unreadable } = savedCopies(exportDir);
+    const tail = unreadable.length ? asOfWords.someUnreadable(unreadable) : "";
+    if (readable.length === 0) return errorResponse(asOfWords.noneReadable(listName) + tail);
+    return errorResponse(asOfWords.noCopy(date, readable) + tail);
+  }
+  const key = String(listName).toLowerCase();
+  const list = data.lists.find(l => l.name === listName) || data.lists.find(l => String(l.name).toLowerCase() === key);
+  if (!list) return textResponse(asOfWords.notInCopy(listName, date));
+  // The live client's own getItems over the copy, so a category, store or
+  // barcode is named by the same rules list_items uses — the main set by its
+  // id, stores by theirs — rather than by a second reading of the format.
+  const view = new AnyListClient();
+  view.targetList = {
+    identifier: list.identifier,
+    name: list.name,
+    items: list.items,
+    stores: data.stores.filter(s => s.listId === list.identifier),
+    categoryGroups: (list.categoryGroups || []).map(g => ({ ...g, categories: data.categories.filter(c => c.categoryGroupId === g.identifier) })),
+    storeFilters: list.storeFilters || [],
+  };
+  const items = await view.getItems(include_checked || false, include_notes || false, include_barcodes || false);
+  return textResponse(itemsText(`"${list.name}" in the ${date} copy`, items, include_checked));
+}
+
+// Where the Pi mounts the nightly copies read-only; tests point it elsewhere.
+// registerAllTools passes nothing, so production reads this.
+const EXPORT_DIR = "/export";
+
+export function register(server, getClient, { exportDir = EXPORT_DIR } = {}) {
   const { elicitListName, elicitItemChoice, elicitRequiredField } = createElicitationHelpers(server);
 
   function findPartialMatches(client, itemName, wantChecked = false) {
@@ -203,7 +320,7 @@ export function register(server, getClient) {
     title: "Shopping Lists & Items",
     description: buildDescription([]),
     inputSchema: {
-      action: z.enum(["list_lists", "list_items", "add_item", "add_items",
+      action: z.enum(["list_lists", "list_items", "list_items_as_of", "add_item", "add_items",
         "update_item", "set_item_category", "set_item_categories", "list_categories", "set_item_store", "check_item", "uncheck_item", "delete_item", "get_favorites", "get_recents", "list_stores",
         "create_store", "rename_store", "delete_store", "lookup_upc", "add_by_upc",
         "set_item_barcode", "rename_recent", "remove_recent"]).describe("The shopping action to perform"),
@@ -225,9 +342,10 @@ export function register(server, getClient) {
       exact: z.boolean().optional().describe("Add the name exactly as given, without matching saved items (add_item only). Use after the person has chosen, or said to add it as written"),
       quantity: z.union([z.number().min(1), z.string().min(1)]).optional().describe("Item quantity, e.g. 2 or \"500 g\" (add_item and update_item; add_item defaults to 1)"),
       notes: z.string().optional().describe("Notes for the item (add_item and update_item; an empty string clears them on update_item)"),
-      include_checked: z.boolean().optional().describe("Include checked-off items (list_items only, default false)"),
-      include_notes: z.boolean().optional().describe("Include notes for each item (list_items only, default false)"),
-      include_barcodes: z.boolean().optional().describe("Show each scanned item's barcode after its name (list_items only, default false)"),
+      date: z.string().optional().describe("The saved copy to read, as YYYY-MM-DD (list_items_as_of only)"),
+      include_checked: z.boolean().optional().describe("Include checked-off items (list_items and list_items_as_of, default false)"),
+      include_notes: z.boolean().optional().describe("Include notes for each item (list_items and list_items_as_of, default false)"),
+      include_barcodes: z.boolean().optional().describe("Show each scanned item's barcode after its name (list_items and list_items_as_of, default false)"),
       store: z.string().optional().describe("The store whose own category set to use (set_item_categories; set_item_category to file the item in that store's view only)"),
       category: z.string().optional().describe("A category on the list, by name — built-in or the household's own; list_categories shows them (add_item, add_items entries, set_item_category). Omit to let AnyList file a new item"),
       store_name: z.string().optional().describe("A store for this item (add_item adds it to the item's stores; set_item_store sets it as the only one, or clears them if blank), or the store to create, rename or delete (create_store, rename_store, delete_store)"),
@@ -269,30 +387,12 @@ export function register(server, getClient) {
             registeredTool.update({ description: buildDescription(stores) });
           }
           const items = await client.getItems(include_checked || false, include_notes || false, params.include_barcodes || false);
-          if (items.length === 0) {
-            return textResponse(include_checked
-              ? `List "${client.targetList.name}" is empty.`
-              : `No unchecked items on list "${client.targetList.name}".`);
-          }
-          const itemsByCategory = {};
-          items.forEach(item => {
-            const cat = item.category || 'other';
-            if (!itemsByCategory[cat]) itemsByCategory[cat] = [];
-            itemsByCategory[cat].push(item);
-          });
-          const itemList = Object.keys(itemsByCategory).sort().map(category => {
-            const categoryItems = itemsByCategory[category].map(item => {
-              const qRaw = item.quantity == null ? "" : String(item.quantity).trim();
-              const qty = (qRaw && qRaw !== "1") ? ` (${qRaw})` : "";
-              const status = item.checked ? " ✓" : "";
-              const note = item.note ? ` [${item.note}]` : "";
-              const store = item.store ? ` @${item.store}` : "";
-              const barcode = item.barcode ? ` [barcode ${item.barcode}]` : "";
-              return `  - ${item.name}${barcode}${qty}${status}${note}${store}`;
-            }).join("\n");
-            return `**${category}**\n${categoryItems}`;
-          }).join("\n\n");
-          return textResponse(`Shopping list "${client.targetList.name}" (${items.length} items):\n${itemList}`);
+          return textResponse(itemsText(`"${client.targetList.name}"`, items, include_checked));
+        }
+        case "list_items_as_of": {
+          const listName = list_name || client.defaultListName || process.env.ANYLIST_LIST_NAME;
+          if (!listName) throw new Error(`Action "list_items_as_of" requires parameter "list_name"`);
+          return itemsAsOf(exportDir, listName, params.date, params);
         }
         case "add_item": {
           let itemName = name;
