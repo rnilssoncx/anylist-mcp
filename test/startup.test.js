@@ -56,6 +56,16 @@ describe('HTTP server startup', () => {
     assert.match(out, /listening on port/);
   });
 
+  it('binds only to HOST when set, and logs the bound address', async () => {
+    const out = await withServer(env({ HOST: '127.0.0.1' }), async () => {});
+    assert.match(out, /Bound address: 127\.0\.0\.1:\d+/);
+  });
+
+  it('binds every interface when HOST is unset', async () => {
+    const out = await withServer(env(), async () => {});
+    assert.match(out, /Bound address: (::|0\.0\.0\.0):\d+/);
+  });
+
   it('does not log request bodies by default', async () => {
     const out = await withServer(env(), base =>
       fetch(`${base}/mcp`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ list: 'SECRET-LIST-ITEM' }) }));
@@ -83,6 +93,20 @@ describe('seed script', () => {
     assert.equal(db.prepare('SELECT count(*) AS n FROM users').get().n, 1);
     assert.equal(db.prepare('SELECT user_id FROM oauth_clients WHERE client_id = ?').get('client-1').user_id,
       db.prepare('SELECT id FROM users').get().id);
+  });
+
+  it('registers the fixed client id when SEED_CLIENT_ID is unset', () => {
+    const e = env({ SEED_EMAIL: 'house@example.com', SEED_CLIENT_SECRET: 'a'.repeat(40), ANYLIST_USERNAME: 'list@example.com', ANYLIST_PASSWORD: 'pw' });
+    const r = spawnSync('node', ['scripts/seed.js'], { env: e, encoding: 'utf8', timeout: 20000 });
+    assert.equal(r.status, 0, r.stderr);
+    const db = new Database(path.join(e.DATA_DIR, 'anylist-mcp.db'), { readonly: true });
+    assert.ok(db.prepare('SELECT 1 FROM oauth_clients WHERE client_id = ?').get('moneypenny-front'));
+  });
+
+  it('still requires SEED_CLIENT_SECRET', () => {
+    const r = spawnSync('node', ['scripts/seed.js'], { env: env({ SEED_EMAIL: 'house@example.com', ANYLIST_USERNAME: 'u', ANYLIST_PASSWORD: 'p' }), encoding: 'utf8', timeout: 20000 });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /seed: missing SEED_CLIENT_SECRET/);
   });
 
   it('exits 1 with the reason when the environment is incomplete', () => {

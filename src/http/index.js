@@ -282,8 +282,14 @@ setInterval(deleteExpiredTokens, 60 * 60 * 1000); // hourly
 validateEnv();
 getDb(); // Initialize DB (runs migrations)
 
-app.listen(PORT, () => {
+// HOST narrows the bind to one interface (mcp-host sets 127.0.0.1 so only the
+// front process in the same container can reach this server). Unset keeps the
+// historical all-interfaces bind, which the Docker/standalone setups rely on.
+const HOST = process.env.HOST || undefined;
+const server = app.listen(PORT, HOST, () => {
+  const a = server.address();
   console.log(`anylist-mcp HTTP server listening on port ${PORT}`);
+  console.log(`Bound address: ${a.address}:${a.port}`);
   console.log(`Base URL: ${process.env.BASE_URL || "(derived from request host)"}`);
   console.log(`Google OAuth: ${isGoogleEnabled() ? "enabled" : "disabled (set GOOGLE_CLIENT_ID to enable)"}`);
 });

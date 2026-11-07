@@ -2,7 +2,7 @@
 // Seed the HTTP server's database from the environment, for a host whose disk
 // starts empty on every boot.
 //
-//   SEED_EMAIL, SEED_CLIENT_ID, SEED_CLIENT_SECRET, ANYLIST_USERNAME,
+//   SEED_EMAIL, SEED_CLIENT_SECRET, (SEED_CLIENT_ID, default moneypenny-front), ANYLIST_USERNAME,
 //   ANYLIST_PASSWORD, optional ANYLIST_LIST_NAME, plus the server's own
 //   DATA_DIR and SERVER_SECRET_KEY.
 //
@@ -24,10 +24,14 @@ import {
   getOAuthClientWithSecret, createConfidentialClient,
 } from "../src/http/db.js";
 
-const REQUIRED = ["SEED_EMAIL", "SEED_CLIENT_ID", "SEED_CLIENT_SECRET", "ANYLIST_USERNAME", "ANYLIST_PASSWORD"];
+// Fixed in code: the secret is what authenticates, the id is only a label, and a
+// caller that generates the secret at each start needs an id that does not move.
+export const DEFAULT_CLIENT_ID = "moneypenny-front";
+const REQUIRED = ["SEED_EMAIL", "SEED_CLIENT_SECRET", "ANYLIST_USERNAME", "ANYLIST_PASSWORD"];
 const MIN_SECRET_LENGTH = 32;
 
-export async function seed(env = process.env) {
+export async function seed(rawEnv = process.env) {
+  const env = { ...rawEnv, SEED_CLIENT_ID: rawEnv.SEED_CLIENT_ID || DEFAULT_CLIENT_ID };
   const missing = REQUIRED.filter(k => !env[k]);
   if (missing.length > 0) throw new Error(`seed: missing ${missing.join(", ")}`);
   if (env.SEED_CLIENT_SECRET.length < MIN_SECRET_LENGTH) {
