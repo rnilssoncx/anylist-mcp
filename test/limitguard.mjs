@@ -391,12 +391,15 @@ const TABLE_RX = /\.(defaults|minima|maxima)\[/g;
 /** The code of each line with strings blanked and comments gone, and the brace depth where it starts. */
 function shape(text) {
   const out = [];
+  const classes = [];  // the brace depth of each enclosing class body, innermost last
   let depth = 0;
   for (const raw of text.split('\n')) {
     const [code] = splitComment(raw, true);
     const blank = code.replace(/(["'`])(?:\\.|(?!\1).)*\1/g, (m) => m[0] + ' '.repeat(m.length - 2) + m[0]);
-    out.push({ raw: code, blank, depth });
+    out.push({ raw: code, blank, depth, classBody: classes.length ? classes[classes.length - 1] : -1 });
+    if (/\bclass\b[^{]*\{/.test(blank)) classes.push(depth + 1);
     for (const c of blank) depth += c === '{' ? 1 : c === '}' ? -1 : 0;
+    while (classes.length && classes[classes.length - 1] > depth) classes.pop();
   }
   return out;
 }
@@ -418,23 +421,38 @@ export function readProblems(cfg) {
     const lines = shape(text);
     let inCtor = -1;
     const tainted = new Map();
-    lines.forEach(({ raw, blank, depth }, i) => {
+    const aliases = new Map();  // a name bound to a constant: `declared = CAP`, `this.cap = CAP`
+    lines.forEach(({ raw, blank, depth, classBody }, i) => {
       const n = i + 1;
       if (/\bconstructor\s*\(/.test(blank)) inCtor = depth;
-      else if (inCtor >= 0 && depth <= inCtor && i > 0 && /^\s*}/.test(blank)) inCtor = -1;
+      else if (inCtor >= 0 && depth <= inCtor + 1 && i > 0 && /^\s*}/.test(blank)) inCtor = -1;  // the constructor's own closing brace
       for (const m of raw.matchAll(DECL_RX)) {
         const applies = /applies:\s*['"](\w+)['"]/.exec(raw)?.[1] ?? 'live';
         declared.push({ path: rel, line: n, name: m[2], ident: m[1] ?? '', applies });
       }
-      for (const m of raw.matchAll(READ_RX)) {
+      for (const m of blank.matchAll(/(?:\bthis\.)?\b(\w+)\s*=\s*(?:\w+\.)?([A-Z][A-Z0-9_]*)\s*;/g)) {
+        aliases.set(m[1], m[2]);  // a read inside a string is blanked, so it is never matched here
+      }
+      // Matched on the blanked line: a read written inside a string is not a read.
+      for (const m of blank.matchAll(READ_RX)) {
         const after = raw.slice(m.index + m[0].length);
         const args = after.slice(0, after.indexOf(')') < 0 ? undefined : after.indexOf(')'));
         const names = [...args.matchAll(/['"`]([a-z0-9_]{1,40})['"`]/g)].map((x) => x[1]);
-        const idents = [...args.matchAll(/\b([A-Z][A-Z0-9_]*)(?:\.name)?\b/g)].map((x) => x[1]);
-        const generic = /\b[a-z]\w*\.name\b/.test(args);
+        // `X` or `X.name` as an argument, never `X.words` or `X.defaults`; `declared.name` and
+        // `this.declared.name` through a name bound to a constant in this file.
+        const idents = [...args.matchAll(/(?<![\w.])([A-Z][A-Z0-9_]*)(?:\.name)?(?![\w.(])/g)].map((x) => x[1]);
+        for (const o of args.matchAll(/(?:this\.)?\b([a-z]\w*)\.name\b/g)) {
+          if (aliases.has(o[1])) idents.push(aliases.get(o[1]));
+        }
+        const generic = [...args.matchAll(/(?:this\.)?\b([a-z]\w*)\.name\b/g)].some((o) => !aliases.has(o[1]));
         const here = depth + [...blank.slice(0, m.index)].reduce(
           (n, c) => n + (c === '{' ? 1 : c === '}' ? -1 : 0), 0);
-        const atImport = here === 0 || /\bfunction\b[^)]*=\s*[^)]*$/.test(raw.slice(0, m.index));
+        const before0 = raw.slice(0, m.index);
+        const inArrow = /=>[^;]*$/.test(before0);  // a concise arrow body runs when called
+        // module level, a default parameter, or a class field (run at construction, as an `__init__`
+        // would, but before any method can read a newer answer)
+        const atImport = !inArrow && (here === 0 || (classBody >= 0 && here === classBody) ||
+          /\bfunction\b[^)]*=\s*[^)]*$/.test(before0));
         reads.push({ path: rel, line: n, atStart: m[0].startsWith('atStart'), names, idents, generic,
           atImport, inCtor: inCtor >= 0, col: m.index });
         const asg = /\b(?:const|let|var)\s+(\w+)\s*=\s*[\w.]*$/.exec(raw.slice(0, m.index));
@@ -442,12 +460,12 @@ export function readProblems(cfg) {
         const before = raw.slice(0, m.index);
         if (/(!\s*|\|\|\s*|&&\s*|\bif\s*\(\s*)[\w.]*$/.test(before) && !/(?:const|let|var)\s+\w+\s*=\s*[\w.]*$/.test(before)) {
           truthy.push({ path: rel, line: n, what: m[0].replace('(', '') });
-        } else if (/^[^)]*\)\s*(\|\||\?\?)/.test(after.slice(after.indexOf(')'))) && after.includes(')')) {
+        } else if (/^[^)]*\)\s*(\|\||&&|\?(?![?.]))/.test(after.slice(after.indexOf(')'))) && after.includes(')')) {
           truthy.push({ path: rel, line: n, what: m[0].replace('(', '') });
         }
       }
       for (const [name] of tainted) {
-        if (new RegExp(`(!\\s*${name}\\b|\\b${name}\\s*\\|\\||\\bif\\s*\\(\\s*${name}\\s*\\))`).test(blank) &&
+        if (new RegExp(`(!\\s*${name}\\b|\\b${name}\\s*(?:\\|\\||&&|\\?(?![?.]))|\\bif\\s*\\(\\s*${name}\\s*\\))`).test(blank) &&
             !new RegExp(`\\b(?:const|let|var)\\s+${name}\\b`).test(blank)) {
           truthy.push({ path: rel, line: n, what: name });
         }
@@ -461,21 +479,18 @@ export function readProblems(cfg) {
   }
   const unread = cfg.unread ?? [];
   const byName = new Map(declared.map((d) => [d.name, d]));
-  const sure = reads;
-  const generic = reads.some((r) => r.generic);
+  // A limit is read when its name, or its constant (`X`, `X.name`, or a name bound to it), is an
+  // argument of a read call. A constant only listed, passed to some other call, or had its `.words`
+  // or `.defaults` read is not read (the Python check's rule, ported).
   for (const d of declared) {
-    const literal = sure.some((r) => r.names.includes(d.name));
-    const owned = !!d.ident && sure.some((r) => r.idents.includes(d.ident));
-    // A constant passed to a call (`Budget(CAP)`) is used; one only listed (`[CAP, OTHER]`) is not.
-    const passed = !!d.ident && new RegExp(`[(,]\\s*${d.ident}\\s*[,)]`).test(allText.replace(
-      new RegExp(`\\[[^\\]]*\\b${d.ident}\\b[^\\]]*\\]`, 'g'), ''));
-    const wired = generic && (d.ident ? passed : true);
-    const ok = literal || owned || wired;
+    const literal = reads.some((r) => r.names.includes(d.name));
+    const owned = !!d.ident && reads.some((r) => r.idents.includes(d.ident));
+    const ok = literal || owned;
     if (unread.includes(d.name)) {
       if (ok) out.push(`${d.path}:${d.line}: the limit \`${d.name}\` is now read; delete it from CONFIG.unread`);
     } else if (!ok) {
       out.push(`${d.path}:${d.line}: the limit \`${d.name}\` is declared and never read: no read ` +
-        'call names it, and no read takes it through a helper');
+        'call names it (its name, its constant, or a name bound to it)');
     }
   }
   for (const name of unread) {
@@ -485,11 +500,23 @@ export function readProblems(cfg) {
     const named = r.names.filter((n) => byName.has(n));
     if (r.atImport) {
       out.push(`${r.path}:${r.line}: a read of ${named.length ? `the limit \`${named[0]}\`` : 'a limit'} ` +
-        'at module level or in a default parameter, run once before Q Branch has answered, so it ' +
+        'at module level, in a class field or in a default parameter, run once before Q Branch has answered, so it ' +
         'is the default for ever; read it where it is used');
     }
+    const own = new Set(named);
+    for (const d of declared) if (d.ident && r.idents.includes(d.ident)) own.add(d.name);
+    for (const name of own) {
+      const kind = byName.get(name)?.applies ?? 'live';
+      if (kind === 'restart' && !r.atStart) {
+        out.push(`${r.path}:${r.line}: \`${name}\` is \`restart\` but is read with \`value\`: the page would ` +
+          'say a change was picked up that the running server did not build with; read it with `atStart`');
+      } else if (kind === 'live' && r.atStart) {
+        out.push(`${r.path}:${r.line}: \`${name}\` is \`live\` but is read with \`atStart\`, which holds the ` +
+          'value it had at start until a restart; read it with `value` where it is used, or declare it `restart`');
+      }
+    }
     if (r.inCtor && !r.atStart) {
-      const live = named.filter((n) => byName.get(n).applies === 'live');
+      const live = [...own].filter((n) => (byName.get(n)?.applies ?? 'live') === 'live');
       if (live.length || r.generic) {
         out.push(`${r.path}:${r.line}: \`${live[0] ?? 'a limit'}\` is read in a constructor but is ` +
           '`live`: it is then read once, and a change on the page needs a restart that the page ' +

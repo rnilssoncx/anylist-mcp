@@ -111,3 +111,66 @@ test('limitguard: a limit known unread is held back and must be dropped once rea
     'src/use.js': "export function f(l) { return l.value('cap_a'); }\n" }, { unread: ['cap_a'] }));
   assert.match(now[0], /`cap_a` is now read; delete it from CONFIG\.unread/);
 });
+
+// -- the code review's folds (080 step 0): what the port had missed -------------------------------
+const USE = (body) => ({ 'src/limits_here.js': DECLARED, 'src/use.js': body });
+
+test('limitguard: a read used with ?: or && is a truth value, and compared it is not', () => {
+  for (const body of ["const x = limits.value('cap_a');\n  return x ? x : 5;",
+    "const x = limits.value('cap_a');\n  return x && n > x;",
+    "return limits.value('cap_a') ? 1 : 2;", "return limits.value('cap_a') && n;"]) {
+    const found = readProblems(scratch(USE(`export function f(limits, n) {\n  ${body}\n}\n`)));
+    assert.ok(found.some((p) => p.includes('used as a condition')), body);
+  }
+  for (const body of ["const x = limits.value('cap_a');\n  return x ?? 5;",
+    "const x = limits.value('cap_a');\n  return x?.y;", "return limits.value('cap_a') > 0 ? 1 : 2;"]) {
+    const found = readProblems(scratch(USE(`export function f(limits) {\n  ${body}\n}\n`)));
+    assert.ok(!found.some((p) => p.includes('used as a condition')), body);
+  }
+});
+
+test('limitguard: a class field read runs at construction and a concise arrow body does not', () => {
+  const field = readProblems(scratch(USE("export class B {\n  cap = limits.value('cap_a');\n}\n")));
+  assert.ok(field.some((p) => p.includes('use.js:2') && p.includes('class field')));
+  const inMethod = readProblems(scratch(USE(
+    "export class B {\n  size(limits) {\n    return limits.value('cap_a');\n  }\n}\n")));
+  assert.deepEqual(inMethod, []);
+  const arrow = readProblems(scratch(USE("export const f = (limits) => limits.value('cap_a');\n")));
+  assert.deepEqual(arrow, []);
+});
+
+test('limitguard: a read written inside a string is not a read, and nor is a constant only mentioned', () => {
+  const inString = readProblems(scratch(USE("export function f() { return \"limits.value('cap_a')\"; }\n")));
+  assert.match(inString[0], /`cap_a` is declared and never read/);
+  for (const body of ['return CAP.words;', 'return CAP.defaults;', 'return make(CAP);']) {
+    const found = readProblems(scratch(USE(`import { CAP } from './limits_here.js';\nexport function f(make) {\n  ${body}\n}\n`),
+      { tableReaders: ['src/use.js'] }));
+    assert.ok(found.some((p) => p.includes('`cap_a` is declared and never read')), body);
+  }
+  for (const body of ['return limits.value(CAP.name);', 'return limits.value(CAP);']) {
+    assert.deepEqual(readProblems(scratch(USE(`import { CAP } from './limits_here.js';\nexport function f(limits) {\n  ${body}\n}\n`))), [], body);
+  }
+});
+
+test('limitguard: a name bound to a constant reads it, and an unbound name does not', () => {
+  const bound = "export class B {\n  constructor() {\n    this.declared = CAP;\n  }\n  size(limits) {\n    return limits.value(this.declared.name);\n  }\n}\n";
+  assert.deepEqual(readProblems(scratch(USE(bound))), []);
+  const unbound = bound.replace('this.declared = CAP;', 'this.declared = other;');
+  assert.match(readProblems(scratch(USE(unbound)))[0], /`cap_a` is declared and never read/);
+});
+
+test('limitguard: a restart limit is read with atStart and a live one with value', () => {
+  const restart = DECLARED.replace("'hour')", "'hour', { applies: 'restart' })");
+  const wrong = readProblems(scratch({ 'src/limits_here.js': restart,
+    'src/use.js': "export function f(limits) { return limits.value('cap_a'); }\n" }));
+  assert.ok(wrong.some((p) => p.includes('`cap_a` is `restart` but is read with `value`')));
+  const frozen = readProblems(scratch(USE("export function f(limits) { return limits.atStart('cap_a'); }\n")));
+  assert.ok(frozen.some((p) => p.includes('`cap_a` is `live` but is read with `atStart`')));
+  assert.deepEqual(readProblems(scratch({ 'src/limits_here.js': restart,
+    'src/use.js': "export function f(limits) { return limits.atStart('cap_a'); }\n" })), []);
+});
+
+test('limitguard: a read in a method after the constructor is not a constructor read', () => {
+  const body = "export class B {\n  constructor() {\n    this.n = 1;\n  }\n  size(limits) {\n    return limits.value('cap_a');\n  }\n}\n";
+  assert.deepEqual(readProblems(scratch(USE(body))), []);
+});
