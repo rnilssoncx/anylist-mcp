@@ -10,7 +10,8 @@
 //
 // A value is marked in place with `// limit-ok: <kind> — <reason of three words or more>` (`#`
 // in YAML, shell and Dockerfiles) on its own line or on a comment-only line directly above it.
-// Kinds: maximum, reply-bound, format, not-a-limit. Every mark is also a line in
+// Kinds: maximum, reply-bound, format, not-a-limit, pi-guard (080: a cap that protects another
+// machine from a broken-into Pi; counts only under `CONFIG.piGuards`, empty meaning nowhere). Every mark is also a line in
 // `limitguard-tags.txt` as `path | scope | what | value | kind | reason`.
 //
 // The todo list is a multiset of `path | scope | what | value` (no line number) and hand-found
@@ -22,12 +23,12 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const HERE = dirname(fileURLToPath(import.meta.url));
 export const NON_SHIPPING = ['deploy/', 'plans/', 'spikes/'];
-export const KINDS = ['maximum', 'reply-bound', 'format', 'not-a-limit'];
+export const KINDS = ['maximum', 'reply-bound', 'format', 'not-a-limit', 'pi-guard'];
 const STRONG = new Set(
   'timeout timeouts seconds wall deadline max cap caps bytes retries attempts limit'.split(' '));
 export const TODO_NAME = 'limitguard-todo.txt';
@@ -61,6 +62,13 @@ export const CONFIG = {
   skip: ['test/', 'tests/', 'evals/', 'docs/', 'anylist-js/', 'node_modules/'],
   textRoots: ['src/', 'scripts/', 'Dockerfile', 'docker-compose', 'compose'],
   replyBound: new Set(),
+  // 080: path prefixes where a `pi-guard` tag counts; empty means nowhere (only mcp-host has any).
+  piGuards: [],
+  // 080 read check: files besides `limits.js` that may read a declaration's own figures, and the
+  // names of limits declared and known not to be read yet (this repository declares none: its
+  // client is built by the conversion sessions, 080 § AnyList's client).
+  tableReaders: [],
+  unread: [],
 };
 
 // ---- Other files: JavaScript, compose, shell, Dockerfile ----
@@ -262,6 +270,13 @@ function todoLines(cfg) {
   return { hits: multiset(hits), anchors };
 }
 
+/** Whether `path`, normalised, sits under a `pi_guards` prefix; matched whole (`walt/` is not
+ *  `waltz/`) and after `..` is resolved, so `walt/../pi/x.js` is `pi/x.js`. */
+export function onPiGuardPath(path, cfg) {
+  const clean = posix.normalize(path);
+  return (cfg.piGuards ?? []).some((g) => clean.startsWith(`${posix.normalize(g).replace(/\/$/, '')}/`));
+}
+
 function tagProblem(hit, cfg) {
   const tag = hit.tag;
   if (!tag) return null;
@@ -273,6 +288,11 @@ function tagProblem(hit, cfg) {
   // in JavaScript (Limits live in Q Branch), so there is no such name to find.
   if (tag.kind === 'maximum') {
     return '`maximum` counts only on a name this file passes into a `Limit(...)`\'s maxima';
+  }
+  if (tag.kind === 'pi-guard' && !onPiGuardPath(hit.path, cfg)) {
+    const at = (cfg.piGuards ?? []).map((g) => `\`${g}\``).join(', ') || 'no path in this repository';
+    return `\`pi-guard\` counts only under ${at} (Config.piGuards): a cap that protects another ` +
+      'machine from a broken-into Pi, so Q Branch, which runs on the Pi, cannot be where it is set';
   }
   if (tag.kind === 'reply-bound' && !cfg.replyBound.has(hit.path)) {
     return '`reply-bound` counts only in a module that reads Q Branch (Config.replyBound)';
@@ -286,7 +306,9 @@ function tagProblem(hit, cfg) {
 const accepted = (hit, cfg) => !!hit.tag && tagProblem(hit, cfg) === null;
 
 export const HOW_OUT = 'Declare it as a Limit (Q Branch\'s Limits page; 059), or, if it is a ' +
-  'maximum, a bound on Q Branch\'s own reply, a format fact or not a limit at all, mark it in ' +
+  'maximum, a bound on Q Branch\'s own reply, a format fact, a cap that protects another ' +
+  'machine from a broken-into Pi (`pi-guard`, only where Config.piGuards allows) or not a limit ' +
+  'at all, mark it in ' +
   'place with `// limit-ok: <kind> — <why, three words or more>` and add the same line to ' +
   `${TAGS_NAME}. Adding it to ${TODO_NAME} is not a way out.`;
 
@@ -355,6 +377,135 @@ export function checkTags(cfg) {
     }
   }
   return out;
+}
+
+
+// ---- The read check (080 § The guard learns a fifth kind and to check reads) ----
+// A line-and-brace port of the canonical detector's read check: every declared limit is read, and
+// read where it is used. There is no Limit in this repository's JavaScript today, so it passes by
+// finding nothing; it is here so the conversion that adds the client is held to the same rules.
+const READ_RX = /\b(?:value|atStart|valueInForce)\(/g;
+const DECL_RX = /(?:\b(?:const|let|var)\s+([A-Z][A-Z0-9_]*)\s*=\s*)?\bnew Limit\(\s*['"`]([a-z0-9_]{1,40})['"`]/g;
+const TABLE_RX = /\.(defaults|minima|maxima)\[/g;
+
+/** The code of each line with strings blanked and comments gone, and the brace depth where it starts. */
+function shape(text) {
+  const out = [];
+  let depth = 0;
+  for (const raw of text.split('\n')) {
+    const [code] = splitComment(raw, true);
+    const blank = code.replace(/(["'`])(?:\\.|(?!\1).)*\1/g, (m) => m[0] + ' '.repeat(m.length - 2) + m[0]);
+    out.push({ raw: code, blank, depth });
+    for (const c of blank) depth += c === '{' ? 1 : c === '}' ? -1 : 0;
+  }
+  return out;
+}
+
+export function readProblems(cfg) {
+  const out = [];
+  const declared = [];
+  const reads = [];
+  const tables = [];
+  const truthy = [];
+  let allText = '';
+  for (const rel of listed(cfg.root)) {
+    if (skipped(rel, cfg)) continue;
+    const base = rel.split('/').pop();
+    if (!/\.(m|c)?js$/.test(base) || !cfg.textRoots.some((r) => rel.startsWith(r))) continue;
+    let text;
+    try { text = readFileSync(join(cfg.root, rel), 'utf8'); } catch { continue; }
+    allText += `${text}\n`;
+    const lines = shape(text);
+    let inCtor = -1;
+    const tainted = new Map();
+    lines.forEach(({ raw, blank, depth }, i) => {
+      const n = i + 1;
+      if (/\bconstructor\s*\(/.test(blank)) inCtor = depth;
+      else if (inCtor >= 0 && depth <= inCtor && i > 0 && /^\s*}/.test(blank)) inCtor = -1;
+      for (const m of raw.matchAll(DECL_RX)) {
+        const applies = /applies:\s*['"](\w+)['"]/.exec(raw)?.[1] ?? 'live';
+        declared.push({ path: rel, line: n, name: m[2], ident: m[1] ?? '', applies });
+      }
+      for (const m of raw.matchAll(READ_RX)) {
+        const after = raw.slice(m.index + m[0].length);
+        const args = after.slice(0, after.indexOf(')') < 0 ? undefined : after.indexOf(')'));
+        const names = [...args.matchAll(/['"`]([a-z0-9_]{1,40})['"`]/g)].map((x) => x[1]);
+        const idents = [...args.matchAll(/\b([A-Z][A-Z0-9_]*)(?:\.name)?\b/g)].map((x) => x[1]);
+        const generic = /\b[a-z]\w*\.name\b/.test(args);
+        const here = depth + [...blank.slice(0, m.index)].reduce(
+          (n, c) => n + (c === '{' ? 1 : c === '}' ? -1 : 0), 0);
+        const atImport = here === 0 || /\bfunction\b[^)]*=\s*[^)]*$/.test(raw.slice(0, m.index));
+        reads.push({ path: rel, line: n, atStart: m[0].startsWith('atStart'), names, idents, generic,
+          atImport, inCtor: inCtor >= 0, col: m.index });
+        const asg = /\b(?:const|let|var)\s+(\w+)\s*=\s*[\w.]*$/.exec(raw.slice(0, m.index));
+        if (asg) tainted.set(asg[1], true);
+        const before = raw.slice(0, m.index);
+        if (/(!\s*|\|\|\s*|&&\s*|\bif\s*\(\s*)[\w.]*$/.test(before) && !/(?:const|let|var)\s+\w+\s*=\s*[\w.]*$/.test(before)) {
+          truthy.push({ path: rel, line: n, what: m[0].replace('(', '') });
+        } else if (/^[^)]*\)\s*(\|\||\?\?)/.test(after.slice(after.indexOf(')'))) && after.includes(')')) {
+          truthy.push({ path: rel, line: n, what: m[0].replace('(', '') });
+        }
+      }
+      for (const [name] of tainted) {
+        if (new RegExp(`(!\\s*${name}\\b|\\b${name}\\s*\\|\\||\\bif\\s*\\(\\s*${name}\\s*\\))`).test(blank) &&
+            !new RegExp(`\\b(?:const|let|var)\\s+${name}\\b`).test(blank)) {
+          truthy.push({ path: rel, line: n, what: name });
+        }
+      }
+      for (const m of blank.matchAll(TABLE_RX)) {
+        if (!/(^|\/)limits\.(m|c)?js$/.test(rel) && !(cfg.tableReaders ?? []).includes(rel)) {
+          tables.push({ path: rel, line: n, table: m[1] });
+        }
+      }
+    });
+  }
+  const unread = cfg.unread ?? [];
+  const byName = new Map(declared.map((d) => [d.name, d]));
+  const sure = reads;
+  const generic = reads.some((r) => r.generic);
+  for (const d of declared) {
+    const literal = sure.some((r) => r.names.includes(d.name));
+    const owned = !!d.ident && sure.some((r) => r.idents.includes(d.ident));
+    // A constant passed to a call (`Budget(CAP)`) is used; one only listed (`[CAP, OTHER]`) is not.
+    const passed = !!d.ident && new RegExp(`[(,]\\s*${d.ident}\\s*[,)]`).test(allText.replace(
+      new RegExp(`\\[[^\\]]*\\b${d.ident}\\b[^\\]]*\\]`, 'g'), ''));
+    const wired = generic && (d.ident ? passed : true);
+    const ok = literal || owned || wired;
+    if (unread.includes(d.name)) {
+      if (ok) out.push(`${d.path}:${d.line}: the limit \`${d.name}\` is now read; delete it from CONFIG.unread`);
+    } else if (!ok) {
+      out.push(`${d.path}:${d.line}: the limit \`${d.name}\` is declared and never read: no read ` +
+        'call names it, and no read takes it through a helper');
+    }
+  }
+  for (const name of unread) {
+    if (!byName.has(name)) out.push(`CONFIG.unread names \`${name}\`, which no Limit declares: delete it`);
+  }
+  for (const r of reads) {
+    const named = r.names.filter((n) => byName.has(n));
+    if (r.atImport) {
+      out.push(`${r.path}:${r.line}: a read of ${named.length ? `the limit \`${named[0]}\`` : 'a limit'} ` +
+        'at module level or in a default parameter, run once before Q Branch has answered, so it ' +
+        'is the default for ever; read it where it is used');
+    }
+    if (r.inCtor && !r.atStart) {
+      const live = named.filter((n) => byName.get(n).applies === 'live');
+      if (live.length || r.generic) {
+        out.push(`${r.path}:${r.line}: \`${live[0] ?? 'a limit'}\` is read in a constructor but is ` +
+          '`live`: it is then read once, and a change on the page needs a restart that the page ' +
+          'does not say; read it where it is used, or declare it `restart` and read it with `atStart`');
+      }
+    }
+  }
+  for (const t of tables) {
+    out.push(`${t.path}:${t.line}: \`.${t.table}[...]\` read outside \`limits.js\`: that is the ` +
+      'figure the limit was declared with, not the value in force; read it with `value(...)`');
+  }
+  for (const t of truthy) {
+    out.push(`${t.path}:${t.line}: the value of a limit (\`${t.what}\`) used as a condition: a ` +
+      'limit of 0 would mean no limit; compare it (`> 0`, `=== undefined`)');
+  }
+  return out.sort();
 }
 
 /** The one line every run ends with. */
