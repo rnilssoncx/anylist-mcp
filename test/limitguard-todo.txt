@@ -1,0 +1,35 @@
+Dockerfile | - | cmd --interval | 30s
+Dockerfile | - | cmd timeout | 5s
+Dockerfile | - | cmd --start-period | 10s
+Dockerfile | - | cmd --retries | 3
+scripts/seed.js | - | const MIN_SECRET_LENGTH | 32;
+src/anylist-client.js | - | const MAIN_SET_NAMESPACE | 'f656a81f-0e0a-419a-a451-21f4f2eac51b';
+src/anylist-client.js | - | const MAX_ROWS | 25;
+src/export.js | - | const FORMAT | "anylist-export/1";
+src/export.js | - | const DATE | /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/;
+src/http/auth/oauth.js | - | prop expires_in | 3600
+src/http/auth/oauth.js | - | prop expires_in | 3600
+src/http/auth/oauth.js | - | prop expires_in | 3600
+src/http/auth/providers/password.js | - | const SALT_ROUNDS | 12;
+src/http/index.js | - | const PORT | parseInt(process.env.PORT,10)||3000;
+src/http/index.js | - | length | 32
+src/http/index.js | - | prop maxAge | 24*60*60*1000
+src/http/index.js | - | slice | 200
+src/http/index.js | - | timer setInterval | 60*60*1000
+src/recipe-normalizer.js | - | prop timeout | 15000
+src/recipe-normalizer.js | - | length | 200
+src/recipe-normalizer.js | - | length | 2
+src/recipe-normalizer.js | - | length | 200
+src/recipe-normalizer.js | - | length | 10
+src/recipe-normalizer.js | - | length | 5
+src/tools/shopping.js | - | const COPY_NAME | /^anylist-([0-9]{4}-[0-9]{2}-[0-9]{2})\.json\.gz$/;
+src/tools/shopping.js | - | length | 3
+src/http/session-manager.js | || 30) * 60 * 1000
+src/http/index.js | || 3600) * 1000
+src/http/db.js | Math.floor(Date.now() / 1000) + 300
+src/http/db.js | now + 3600,
+src/http/db.js | now + 86400 * 30
+src/http/index.js | app.use(express.json());
+src/recipe-normalizer.js | res.on('data', chunk => data += chunk)
+src/recipe-normalizer.js | res.statusCode >= 300 && res.statusCode < 400
+docker-compose.yml | ANYLIST_SESSION_IDLE_MINUTES:-30
