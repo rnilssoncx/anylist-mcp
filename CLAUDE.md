@@ -1,3 +1,7 @@
+**Household fork:** the household rules apply here too, alongside upstream's guidance below.
+
+@~/Projects/personal/moneypenny/household/rules.md
+
 # CLAUDE.md
 
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
